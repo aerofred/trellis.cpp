@@ -317,7 +317,8 @@ std::vector<float> welded_normals_gltf(const float* pos, int64_t V,
 bool write_glb_textured(const char* path, const float* verts, int64_t V, const float* uv,
                         const int32_t* faces, int64_t F,
                         const unsigned char* base_rgba, const unsigned char* mr_rgba, int T,
-                        bool double_sided, int64_t seed, const char* copyright, bool use_webp) {
+                        bool double_sided, int64_t seed, const char* copyright, bool use_webp,
+                        const unsigned char* normal_rgba, bool mr_has_occlusion) {
     // rotate positions (x,z,-y) + min/max
     std::vector<float> pos((size_t)V*3);
     float mn[3]={FLT_MAX,FLT_MAX,FLT_MAX}, mx[3]={-FLT_MAX,-FLT_MAX,-FLT_MAX};
@@ -347,6 +348,8 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
         stbi_write_png_to_func(png_collect, &pngB, T, T, 4, base_rgba, T*4);
         stbi_write_png_to_func(png_collect, &pngM, T, T, 4, mr_rgba, T*4);
     }
+    std::vector<uint8_t> pngN;
+    if (normal_rgba) stbi_write_png_to_func(png_collect, &pngN, T, T, 4, normal_rgba, T*4);
 
     auto pad4=[](std::vector<uint8_t>&b){ while(b.size()%4) b.push_back(0); };
     const uint32_t posB=(uint32_t)(V*12), nrmB=(uint32_t)(V*12), uvB=(uint32_t)(V*8), idxB=(uint32_t)(F*12);
@@ -357,7 +360,22 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
     for (int64_t i=0;i<F*3;++i){ uint32_t v=(uint32_t)faces[i]; std::memcpy(bin.data()+posB+nrmB+uvB+i*4,&v,4); }
     pad4(bin); const uint32_t off4=(uint32_t)bin.size();
     bin.insert(bin.end(), pngB.begin(), pngB.end()); pad4(bin); const uint32_t off5=(uint32_t)bin.size();
-    bin.insert(bin.end(), pngM.begin(), pngM.end()); pad4(bin);
+    bin.insert(bin.end(), pngM.begin(), pngM.end()); pad4(bin); const uint32_t off6=(uint32_t)bin.size();
+    bin.insert(bin.end(), pngN.begin(), pngN.end()); pad4(bin);
+    const char* mime = webp ? "image/webp" : "image/png";
+    const std::string tex_n = !normal_rgba ? std::string()
+        : std::string(",\"normalTexture\":{\"index\":2}") + (mr_has_occlusion ? ",\"occlusionTexture\":{\"index\":1}" : "");
+    const std::string tex_occ_only = (!normal_rgba && mr_has_occlusion) ? ",\"occlusionTexture\":{\"index\":1}" : "";
+    std::string textures = webp
+        ? "\"textures\":[{\"sampler\":0,\"extensions\":{\"EXT_texture_webp\":{\"source\":0}}},{\"sampler\":0,\"extensions\":{\"EXT_texture_webp\":{\"source\":1}}}"
+        : "\"textures\":[{\"source\":0,\"sampler\":0},{\"source\":1,\"sampler\":0}";
+    if (normal_rgba) textures += ",{\"source\":2,\"sampler\":0}";
+    textures += "],";
+    std::string images = std::string("\"images\":[{\"bufferView\":4,\"mimeType\":\"") + mime + "\"},{\"bufferView\":5,\"mimeType\":\"" + mime + "\"}";
+    if (normal_rgba) images += ",{\"bufferView\":6,\"mimeType\":\"image/png\"}";
+    images += "],";
+    char view6[96] = "";
+    if (normal_rgba) std::snprintf(view6, sizeof(view6), ",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}", off6, (uint32_t)pngN.size());
 
     const std::string asset_meta = asset_extras_json(seed);
     const std::string generator = generator_label();
@@ -369,9 +387,9 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
         "%s"
         "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],"
         "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0,\"mode\":4}]}],"
-        "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},\"metallicRoughnessTexture\":{\"index\":1},\"metallicFactor\":1.0,\"roughnessFactor\":1.0},\"alphaMode\":\"OPAQUE\",\"doubleSided\":%s}],"
+        "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},\"metallicRoughnessTexture\":{\"index\":1},\"metallicFactor\":1.0,\"roughnessFactor\":1.0}%s%s,\"alphaMode\":\"OPAQUE\",\"doubleSided\":%s}],"
         "%s"
-        "\"images\":[{\"bufferView\":4,\"mimeType\":\"%s\"},{\"bufferView\":5,\"mimeType\":\"%s\"}],"
+        "%s"
         "\"samplers\":[{}],"
         "\"accessors\":["
         "{\"bufferView\":0,\"componentType\":5126,\"count\":%lld,\"type\":\"VEC3\",\"min\":[%.9g,%.9g,%.9g],\"max\":[%.9g,%.9g,%.9g]},"
@@ -384,18 +402,17 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
         "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},"
         "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34963},"
         "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u},"
-        "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}],"
+        "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}%s],"
         "\"buffers\":[{\"byteLength\":%u}]}",
         generator.c_str(), asset_copyright.c_str(), asset_meta.c_str(),
         webp ? "\"extensionsUsed\":[\"EXT_texture_webp\"],\"extensionsRequired\":[\"EXT_texture_webp\"]," : "",
+        tex_n.c_str(), tex_occ_only.c_str(),
         double_sided ? "true" : "false",
-        webp ? "\"textures\":[{\"sampler\":0,\"extensions\":{\"EXT_texture_webp\":{\"source\":0}}},{\"sampler\":0,\"extensions\":{\"EXT_texture_webp\":{\"source\":1}}}],"
-             : "\"textures\":[{\"source\":0,\"sampler\":0},{\"source\":1,\"sampler\":0}],",
-        webp ? "image/webp" : "image/png", webp ? "image/webp" : "image/png",
+        textures.c_str(), images.c_str(),
         (long long)V, mn[0],mn[1],mn[2],mx[0],mx[1],mx[2],
         (long long)V, (long long)V, (long long)(F*3),
         posB, posB,nrmB, posB+nrmB,uvB, posB+nrmB+uvB,idxB,
-        off4,(uint32_t)pngB.size(), off5,(uint32_t)pngM.size(), (uint32_t)bin.size());
+        off4,(uint32_t)pngB.size(), off5,(uint32_t)pngM.size(), view6, (uint32_t)bin.size());
     std::string json(buf);
     while (json.size()%4) json.push_back(' ');
 

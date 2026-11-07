@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -193,15 +194,22 @@ DitRunner* make_sparse_runner(const Model& m, const DiTParams& p,
 std::vector<float> sample_flow(const FlowFwd& fwd, std::vector<float> sample,
                                const FlowCond& cond, const FlowCond& neg_cond, const SamplerParams& sp,
                                std::vector<std::vector<float>>* trace) {
-    return sample_flow_multi(fwd, std::move(sample), std::vector<FlowCond>{ cond }, false, neg_cond, sp, trace);
+    return sample_flow_multi(fwd, std::move(sample), std::vector<FlowCond>{ cond }, MultiView{}, neg_cond, sp, trace);
 }
 
 std::vector<float> sample_flow_multi(const FlowFwd& fwd, std::vector<float> sample,
-                                     const std::vector<FlowCond>& conds, bool average,
+                                     const std::vector<FlowCond>& conds, const MultiView& mv,
                                      const FlowCond& neg_cond, const SamplerParams& sp,
                                      std::vector<std::vector<float>>* trace) {
     if (conds.empty()) throw std::runtime_error("sample_flow_multi: no conditioning");
     const int n_views = (int)conds.size();
+    // Normalized per-view weights (missing entries count 1; a zero weight drops the view).
+    std::vector<double> w((size_t)n_views, 1.0);
+    for (int v = 0; v < n_views && v < (int)mv.weights.size(); ++v) w[(size_t)v] = std::max(0.0f, mv.weights[(size_t)v]);
+    double wsum = 0; for (double x : w) wsum += x;
+    if (wsum <= 0) throw std::runtime_error("sample_flow_multi: every view weight is zero");
+    for (double& x : w) x /= wsum;
+    std::vector<double> credit((size_t)n_views, 0.0);   // stochastic: weighted round-robin state
     const float sm = sp.sigma_min;
     const size_t Nst = sample.size();
     std::vector<float> ts(sp.steps + 1);
@@ -214,16 +222,31 @@ std::vector<float> sample_flow_multi(const FlowFwd& fwd, std::vector<float> samp
     static const bool no_fix   = std::getenv("TRELLIS_NOFIX") != nullptr;  // robustness guards ON by default
     const auto tflow0 = std::chrono::steady_clock::now();
     int n_fwd = 0;
-    // Conditional velocity at step i: one view (in turn), or the mean over every view.
-    auto fwd_pos = [&](int i, float tscaled) {
-        if (n_views == 1 || !average) { ++n_fwd; return fwd(sample, tscaled, conds[(size_t)(i % n_views)]); }
-        std::vector<float> acc = fwd(sample, tscaled, conds[0]); ++n_fwd;
-        for (int v = 1; v < n_views; ++v) {
-            const std::vector<float> o = fwd(sample, tscaled, conds[(size_t)v]); ++n_fwd;
-            for (size_t k = 0; k < acc.size(); ++k) acc[k] += o[k];
+    // Conditional velocity at flow time t. Outside [t_lo, t_hi] the first view conditions alone.
+    // Inside: stochastic picks one view per step by weighted round-robin (the view furthest
+    // behind its share; equal weights give 0,1,...,N-1,0,...), multidiffusion takes the
+    // weighted mean of every view's velocity.
+    auto fwd_pos = [&](float t, float tscaled) {
+        const bool active = n_views > 1 && t >= mv.t_lo && t <= mv.t_hi;
+        if (!active) { ++n_fwd; return fwd(sample, tscaled, conds[0]); }
+        if (!mv.average) {
+            int best = 0;
+            for (int v = 0; v < n_views; ++v) {
+                credit[(size_t)v] += w[(size_t)v];
+                if (credit[(size_t)v] > credit[(size_t)best] + 1e-9) best = v;
+            }
+            credit[(size_t)best] -= 1.0;
+            ++n_fwd;
+            return fwd(sample, tscaled, conds[(size_t)best]);
         }
-        const float inv = 1.0f / (float)n_views;
-        for (float& x : acc) x *= inv;
+        std::vector<float> acc;
+        for (int v = 0; v < n_views; ++v) {
+            if (w[(size_t)v] <= 0) continue;
+            const std::vector<float> o = fwd(sample, tscaled, conds[(size_t)v]); ++n_fwd;
+            const float wv = (float)w[(size_t)v];
+            if (acc.empty()) { acc.resize(o.size()); for (size_t k = 0; k < o.size(); ++k) acc[k] = wv * o[k]; }
+            else for (size_t k = 0; k < acc.size(); ++k) acc[k] += wv * o[k];
+        }
         return acc;
     };
     auto fstats = [](const std::vector<float>& v, size_t& bad, double& mx) {
@@ -253,12 +276,12 @@ std::vector<float> sample_flow_multi(const FlowFwd& fwd, std::vector<float> samp
         const float gs = (sp.gi0 <= t && t <= sp.gi1) ? sp.guidance_strength : 1.0f;
         const float tscaled = 1000.0f * t;
         if (gs == 1.0f) {
-            pred = fwd_pos(i, tscaled);
+            pred = fwd_pos(t, tscaled);
         } else if (gs == 0.0f) {
             pred = fwd(sample, tscaled, neg_cond);
             ++n_fwd;
         } else {
-            pos = fwd_pos(i, tscaled);
+            pos = fwd_pos(t, tscaled);
             neg = fwd(sample, tscaled, neg_cond);
             ++n_fwd;
             for (size_t k = 0; k < Nst; ++k) pred[k] = gs * pos[k] + (1 - gs) * neg[k];
@@ -294,7 +317,7 @@ std::vector<float> sample_flow_multi(const FlowFwd& fwd, std::vector<float> samp
     if (tty) printf("\n");
     printf("      [flow] %d steps, %d forwards, %.1fs", sp.steps, n_fwd,
            std::chrono::duration<double>(std::chrono::steady_clock::now() - tflow0).count());
-    if (n_views > 1) printf("  (%d views, %s)", n_views, average ? "multidiffusion" : "stochastic");
+    if (n_views > 1) printf("  (%d views, %s)", n_views, mv.average ? "multidiffusion" : "stochastic");
     printf("\n");
     fflush(stdout);
     return sample;

@@ -190,6 +190,60 @@ TriBvh::Hit TriBvh::closest_filtered(const float p[3], PointFilter accept, void 
     return hit;
 }
 
+bool TriBvh::occluded(const float o[3], const float d[3], float tmax) const {
+    if (nodes_.empty()) return false;
+    const float inv[3] = { d[0] != 0.f ? 1.f / d[0] : 1e30f, d[1] != 0.f ? 1.f / d[1] : 1e30f,
+                           d[2] != 0.f ? 1.f / d[2] : 1e30f };
+    auto box_hit = [&](const Node& n) {
+        float t0 = 0.f, t1 = tmax;
+        for (int k = 0; k < 3; ++k) {
+            float a = (n.bmin[k] - o[k]) * inv[k], b = (n.bmax[k] - o[k]) * inv[k];
+            if (a > b) std::swap(a, b);
+            t0 = std::max(t0, a); t1 = std::min(t1, b);
+            if (t0 > t1) return false;
+        }
+        return true;
+    };
+    int32_t stack[64];
+    int sp = 0;
+    if (!box_hit(nodes_[0])) return false;
+    stack[sp++] = 0;
+    while (sp) {
+        const Node& n = nodes_[stack[--sp]];
+        if (n.count) {
+            for (int32_t i = 0; i < n.count; ++i) {
+                const int32_t f = prim_[n.left + i];
+                const float* a = &verts_[3*faces_[3*f]];
+                const float* b = &verts_[3*faces_[3*f+1]];
+                const float* c = &verts_[3*faces_[3*f+2]];
+                // Moller-Trumbore, two-sided.
+                const float e1[3] = { b[0]-a[0], b[1]-a[1], b[2]-a[2] };
+                const float e2[3] = { c[0]-a[0], c[1]-a[1], c[2]-a[2] };
+                const float pv[3] = { d[1]*e2[2]-d[2]*e2[1], d[2]*e2[0]-d[0]*e2[2], d[0]*e2[1]-d[1]*e2[0] };
+                const float det = dot3(e1, pv);
+                if (std::fabs(det) < 1e-20f) continue;
+                const float id = 1.f / det;
+                const float tv[3] = { o[0]-a[0], o[1]-a[1], o[2]-a[2] };
+                const float u = dot3(tv, pv) * id;
+                if (u < 0.f || u > 1.f) continue;
+                const float qv[3] = { tv[1]*e1[2]-tv[2]*e1[1], tv[2]*e1[0]-tv[0]*e1[2], tv[0]*e1[1]-tv[1]*e1[0] };
+                const float v = dot3(d, qv) * id;
+                if (v < 0.f || u + v > 1.f) continue;
+                const float t = dot3(e2, qv) * id;
+                if (t > 0.f && t <= tmax) return true;
+            }
+            continue;
+        }
+        const Node& l = nodes_[n.left];
+        const Node& r = nodes_[n.left + 1];
+        if (sp + 2 <= 64) {
+            if (box_hit(r)) stack[sp++] = n.left + 1;
+            if (box_hit(l)) stack[sp++] = n.left;
+        }
+    }
+    return false;
+}
+
 bool TriBvh::visit_overlapping(const float bmin[3], const float bmax[3], BoxVisitor visit, void *context) const {
     if (nodes_.empty()) return true;
     int32_t stack[64];

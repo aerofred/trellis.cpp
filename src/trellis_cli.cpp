@@ -13,6 +13,7 @@
 #include "dual_grid.h"
 #include "mesh_glb.h"
 #include "uv_bake.h"
+#include "detail_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
 #include "mesh_shape.h"
@@ -26,6 +27,8 @@
 #include <cstdint>
 #include <memory>
 #include <utility>
+#include <functional>
+#include <algorithm>
 #include <random>
 #include <vector>
 #include <string>
@@ -63,6 +66,118 @@ static void slat_stats(const char* tag, const vector<float>& v) {
     size_t n = v.size() - bad; double mean = n ? s / n : 0, var = n ? s2 / n - mean * mean : 0;
     printf("      [stats] %s n=%zu mean=%.4f std=%.4f min=%.3f max=%.3f nan/inf=%zu\n",
            tag, v.size(), mean, var > 0 ? std::sqrt(var) : 0.0, mn, mx, bad);
+}
+
+// Seed search: how well a decoded sparse structure (occupancy logits, torch [64,64,64],
+// flat = x*4096 + y*64 + z) matches the input matte. Measured grid convention when TRELLIS keeps
+// the input view: the camera looks along grid x, image right = -y, image down = -z. TRELLIS does
+// not always keep it -- per seed the same object can come out reversed, upside down or lying on
+// its side -- so the structure is tried in all 24 right-angle orientations and scored in the
+// best one (the input-aligned one wins near-ties). Both silhouettes are framed alike -- bbox
+// centred, longest side 56 of a 64 frame -- so the score compares shape and aspect, not the
+// cutout's margin; a frame cell is set when at least half of its 4x4 sub-samples are inside.
+static std::vector<unsigned char> frame_silhouette(int W, int H, const std::function<bool(int,int)>& inside) {
+    constexpr int F = 64, SUB = 4;
+    int x0 = W, y0 = H, x1 = -1, y1 = -1;
+    for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x)
+        if (inside(x, y)) { x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y); }
+    std::vector<unsigned char> out((size_t)F * F, 0);
+    if (x1 < 0) return out;
+    const double cx = (x0 + x1 + 1) * 0.5, cy = (y0 + y1 + 1) * 0.5;
+    const double scale = 56.0 / std::max(x1 - x0 + 1, y1 - y0 + 1);   // frame cells per source pixel
+    for (int j = 0; j < F; ++j) for (int i = 0; i < F; ++i) {
+        int hits = 0;
+        for (int sj = 0; sj < SUB; ++sj) for (int si = 0; si < SUB; ++si) {
+            const int x = (int)std::floor(cx + (i + (si + 0.5) / SUB - F * 0.5) / scale);
+            const int y = (int)std::floor(cy + (j + (sj + 0.5) / SUB - F * 0.5) / scale);
+            if (x >= 0 && y >= 0 && x < W && y < H && inside(x, y)) ++hits;
+        }
+        out[(size_t)j * F + i] = hits * 2 >= SUB * SUB;
+    }
+    return out;
+}
+
+// A proper right-angle rotation of an R^3 grid: out[i] = sgn[i] > 0 ? in[perm[i]] : R-1-in[perm[i]].
+struct GridRot { int perm[3]; int sgn[3]; };
+static const std::vector<GridRot>& grid_rotations() {
+    static const std::vector<GridRot> rots = [] {
+        std::vector<GridRot> r;
+        const int perms[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+        const int parity[6] = {1,-1,-1,1,1,-1};
+        for (int p = 0; p < 6; ++p) for (int m = 0; m < 8; ++m) {
+            const int s0 = m & 1 ? -1 : 1, s1 = m & 2 ? -1 : 1, s2 = m & 4 ? -1 : 1;
+            if (parity[p] * s0 * s1 * s2 != 1) continue;   // proper rotations only (no mirror)
+            r.push_back({{perms[p][0], perms[p][1], perms[p][2]}, {s0, s1, s2}});
+        }
+        return r;   // 24, identity first
+    }();
+    return rots;
+}
+static std::array<int,3> rotate_cell(const GridRot& g, const std::array<int,3>& c, int R) {
+    std::array<int,3> o;
+    for (int i = 0; i < 3; ++i) o[i] = g.sgn[i] > 0 ? c[g.perm[i]] : R - 1 - c[g.perm[i]];
+    return o;
+}
+
+struct SilScore { double iou = 0; int rot = 0; };
+
+// Seed search: share of the occupied 64^3 cells that belong to a one-cell-thick SHEET -- empty on
+// both sides along one axis, filled all around in the plane across it. TRELLIS's typical failure
+// is a stray flat panel or veil (a plate behind a fist, a skirt off a sleeve); solid parts and
+// thin rods (barrels, fingers) score low. Only meaningful between seeds of the same image.
+static double sheet_fraction(const std::vector<float>& logits) {
+    constexpr int S = 64;
+    auto occ = [&](int x, int y, int z) {
+        return x >= 0 && y >= 0 && z >= 0 && x < S && y < S && z < S && logits[((size_t)x * S + y) * S + z] > 0.0f;
+    };
+    size_t n = 0, sheet = 0;
+    for (int x = 0; x < S; ++x) for (int y = 0; y < S; ++y) for (int z = 0; z < S; ++z) {
+        if (!occ(x, y, z)) continue;
+        ++n;
+        const bool sx = !occ(x-1,y,z) && !occ(x+1,y,z) && occ(x,y-1,z) && occ(x,y+1,z) && occ(x,y,z-1) && occ(x,y,z+1);
+        const bool sy = !occ(x,y-1,z) && !occ(x,y+1,z) && occ(x-1,y,z) && occ(x+1,y,z) && occ(x,y,z-1) && occ(x,y,z+1);
+        const bool sz = !occ(x,y,z-1) && !occ(x,y,z+1) && occ(x-1,y,z) && occ(x+1,y,z) && occ(x,y-1,z) && occ(x,y+1,z);
+        sheet += sx || sy || sz;
+    }
+    return n ? (double)sheet / n : 0.0;
+}
+// `orientations`: 0 all 24 turns, 1 only turns about the vertical (grid z) axis, 2 identity only.
+static SilScore silhouette_score(const std::vector<float>& logits, const std::vector<unsigned char>& cutout, int csz,
+                                 int orientations, const char* dbg_png = nullptr) {
+    constexpr int S = 64;
+    SilScore best;
+    if (cutout.size() != (size_t)csz * csz * 4) return best;
+    std::vector<std::array<int,3>> cells;
+    for (int x = 0; x < S; ++x) for (int y = 0; y < S; ++y) for (int z = 0; z < S; ++z)
+        if (logits[((size_t)x * S + y) * S + z] > 0.0f) cells.push_back({x, y, z});
+    const auto b = frame_silhouette(csz, csz, [&](int x, int y) { return cutout[((size_t)y * csz + x) * 4 + 3] > 127; });
+    const auto& rots = grid_rotations();
+    std::vector<unsigned char> best_a;
+    double best_rank = -1;
+    for (int r = 0; r < (int)rots.size(); ++r) {
+        if (orientations == 2 && r != 0) break;
+        if (orientations == 1 && !(rots[(size_t)r].perm[2] == 2 && rots[(size_t)r].sgn[2] > 0)) continue;
+        std::vector<unsigned char> proj((size_t)S * S, 0);   // [row = 63 - z][col = 63 - y]
+        for (const auto& c : cells) {
+            const auto o = rotate_cell(rots[(size_t)r], c, S);
+            proj[(size_t)(S - 1 - o[2]) * S + (S - 1 - o[1])] = 1;
+        }
+        auto a = frame_silhouette(S, S, [&](int x, int y) { return proj[(size_t)y * S + x] != 0; });
+        size_t inter = 0, uni = 0;
+        for (size_t k = 0; k < a.size(); ++k) { inter += a[k] && b[k]; uni += a[k] || b[k]; }
+        const double iou = uni ? (double)inter / uni : 0.0;
+        const double rank = r == 0 ? iou + 0.02 : iou;   // the input-aligned orientation wins near-ties
+        if (rank > best_rank) { best_rank = rank; best.iou = iou; best.rot = r; best_a = std::move(a); }
+    }
+    if (dbg_png) {   // red = structure only, blue = matte only, white = both (best orientation)
+        std::vector<unsigned char> rgb(b.size() * 3);
+        for (size_t k = 0; k < b.size(); ++k) {
+            const bool a = best_a[k] != 0;
+            rgb[k*3] = a ? 255 : 0; rgb[k*3+1] = a && b[k] ? 255 : 0; rgb[k*3+2] = b[k] ? 255 : 0;
+        }
+        stbi_write_png(dbg_png, S, S, 3, rgb.data(), S * 3);
+    }
+    return best;
 }
 
 static const float SHAPE_MEAN[32]={0.781296f,0.018091f,-0.495192f,-0.558457f,1.060530f,0.093252f,1.518149f,-0.933218f,-0.732996f,2.604095f,-0.118341f,-2.143904f,0.495076f,-2.179512f,-2.130751f,-0.996944f,0.261421f,-2.217463f,1.260067f,-0.150213f,3.790713f,1.481266f,-1.046058f,-1.523667f,-0.059621f,2.220780f,1.621212f,0.877230f,0.567247f,-3.175944f,-3.186688f,1.578665f};
@@ -137,7 +252,14 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     // swallows stage progress when piped (e.g. under Lemonade) if the process crashes.
     setvbuf(stdout, nullptr, _IONBF, 0);
     uint32_t run_seed = cfg.seed;
-    if (run_seed == 0) {
+    if (cfg.seeds.size() > 1) {
+        std::string list;
+        for (uint32_t s : cfg.seeds) list += (list.empty() ? "" : ",") + std::to_string(s);
+        fprintf(stderr, "[trellis] generating model with a seed search over %s\n", list.c_str());
+    } else if (cfg.seeds.size() == 1) {
+        run_seed = cfg.seeds[0];
+        fprintf(stderr, "[trellis] generating model with seed %u\n", run_seed);
+    } else if (run_seed == 0) {
         std::random_device rd;
         run_seed = (uint32_t(rd()) << 16) ^ uint32_t(rd()) ^
                    uint32_t(std::chrono::high_resolution_clock::now().time_since_epoch().count());
@@ -228,6 +350,12 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         printf("[trellis] %d views, %s, stages:%s%s%s\n", n_views,
                cfg.multi_mode == trellis::MultiImageMode::MultiDiffusion ? "multidiffusion" : "stochastic",
                cfg.multi_ss ? " ss" : "", cfg.multi_shape ? " shape" : "", cfg.multi_tex ? " tex" : "");
+    if (n_views > 1 && (!cfg.view_weights.empty() || cfg.multi_t_lo > 0.0f || cfg.multi_t_hi < 1.0f)) {
+        printf("      weights:");
+        for (int v = 0; v < n_views; ++v)
+            printf(" %.2f", v < (int)cfg.view_weights.size() ? cfg.view_weights[(size_t)v] : 1.0f);
+        printf("  interval t in [%.2f, %.2f]\n", cfg.multi_t_lo, cfg.multi_t_hi);
+    }
 
     bool have_birefnet = false;
     if (cfg.birefnet < 0) {
@@ -333,7 +461,10 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     const int Lc1024 = cascade ? (int)(cond1024.size() / 1024 / n_views) : 0;
     vector<float> neg1024((size_t)Lc1024 * 1024, 0.0f);
     // The positive CFG branch of each view; `proj` (Pixal3D, single view only) rides on view 0.
-    const bool multi_avg = cfg.multi_mode == trellis::MultiImageMode::MultiDiffusion;
+    trellis::MultiView multi_view;
+    multi_view.average = cfg.multi_mode == trellis::MultiImageMode::MultiDiffusion;
+    multi_view.weights = cfg.view_weights;
+    multi_view.t_lo = cfg.multi_t_lo; multi_view.t_hi = cfg.multi_t_hi;
     auto view_conds = [&](const float* all, int lc, const float* proj, bool use_all) {
         vector<trellis::FlowCond> cs;
         for (int v = 0; v < (use_all ? n_views : 1); ++v)
@@ -377,9 +508,18 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         return pc;
     };
 
-    printf("[3/6] sparse-structure flow + decode\n");
+    // Seed search: every candidate seed restarts the RNG exactly as a fresh --seed run would,
+    // so the finished model is the one `--seed <chosen>` produces.
+    const vector<uint32_t> ss_seeds = cfg.seeds.size() > 1 ? cfg.seeds : vector<uint32_t>{ run_seed };
+    printf("[3/6] sparse-structure flow + decode%s\n",
+           ss_seeds.size() > 1 ? (" (seed search over " + std::to_string(ss_seeds.size()) + " seeds)").c_str() : "");
     vector<std::array<int,3>> coords;
     {
+        struct SeedCand {
+            uint32_t seed; std::mt19937 rng; std::normal_distribution<float> randn;
+            vector<std::array<int,3>> coords; double sil = 0, sheet = 0, score = 0; int rot = 0;
+        };
+        vector<SeedCand> cands;
         trellis::Model m = trellis::Model::load(M + FP + "ss_flow.gguf", gpu);
         trellis::DiTParams p; p.in_ch = 8; p.out_ch = 8; p.d_cond = 1024; p.cast_f32 = F32;
         p.proj_ch = proj_ch_of(m); p.proj_mode = p.proj_ch > 0;
@@ -390,22 +530,59 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::DitRunner* run = trellis::make_dense_runner(m, p, 16, Lc);
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const trellis::FlowCond& c){ return run->forward(x, ts, c); };
         trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=cfg.gss; sp.guidance_rescale=0.7f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=5.0f;
-        vector<float> z = trellis::sample_flow_multi(fwd, noise(8*4096),
-                              view_conds(cond.data(), Lc, pix ? pc.proj.data() : nullptr, cfg.multi_ss), multi_avg,
-                              trellis::FlowCond(neg.data(),  nullptr), sp);  // [8,4096] ne0=8
-        delete run; m.free();
-        // transpose [8,L] -> torch [8,16,16,16] memory (c*4096 + sp)
-        vector<float> zdec(8*4096);
-        for (int c = 0; c < 8; ++c) for (int sp2 = 0; sp2 < 4096; ++sp2) zdec[(size_t)c*4096 + sp2] = z[c + 8*sp2];
-        // This small decoder currently miscomputes a CONT/view-to-ADD chain on HTP.
-        // Its CPU cost is negligible; other backends retain their existing placement.
-        const std::string saved_backend = trellis::g_backend;
-        const bool ss_dec_on_cpu = backend_is_htp(requested_backend);
-        if (ss_dec_on_cpu) trellis::g_backend = "CPU";
-        trellis::Model d = trellis::Model::load(M + "/ss_dec.gguf", ss_dec_on_cpu ? -1 : gpu);
-        trellis::g_backend = saved_backend;
-        vector<float> logits = trellis::ss_decode(d, zdec); d.free();
-        coords = trellis::ss_coords(logits, 64, 32);
+        for (size_t si = 0; si < ss_seeds.size(); ++si) {
+            const uint32_t s = ss_seeds[si];
+            if (ss_seeds.size() > 1) { rng.seed(s); randn.reset(); printf("      seed %u\n", s); }
+            vector<float> z = trellis::sample_flow_multi(fwd, noise(8*4096),
+                                  view_conds(cond.data(), Lc, pix ? pc.proj.data() : nullptr, cfg.multi_ss), multi_view,
+                                  trellis::FlowCond(neg.data(),  nullptr), sp);  // [8,4096] ne0=8
+            const bool last = si + 1 == ss_seeds.size();
+            if (last) { delete run; run = nullptr; m.free(); }
+            // transpose [8,L] -> torch [8,16,16,16] memory (c*4096 + sp)
+            vector<float> zdec(8*4096);
+            for (int c = 0; c < 8; ++c) for (int sp2 = 0; sp2 < 4096; ++sp2) zdec[(size_t)c*4096 + sp2] = z[c + 8*sp2];
+            // This small decoder currently miscomputes a CONT/view-to-ADD chain on HTP.
+            // Its CPU cost is negligible; other backends retain their existing placement.
+            const std::string saved_backend = trellis::g_backend;
+            const bool ss_dec_on_cpu = backend_is_htp(requested_backend);
+            if (ss_dec_on_cpu) trellis::g_backend = "CPU";
+            trellis::Model d = trellis::Model::load(M + "/ss_dec.gguf", ss_dec_on_cpu ? -1 : gpu);
+            trellis::g_backend = saved_backend;
+            vector<float> logits = trellis::ss_decode(d, zdec); d.free();
+            SeedCand c{ s, rng, randn, trellis::ss_coords(logits, 64, 32) };
+            if (ss_seeds.size() > 1) {
+                // TRELLIS_DBG_SIL=<dir>: write each candidate's framed silhouettes (structure red,
+                // matte blue, overlap white) as <dir>/sil_<seed>.png.
+                const char* dd = std::getenv("TRELLIS_DBG_SIL");
+                const std::string png = dd ? std::string(dd) + "/sil_" + std::to_string(s) + ".png" : std::string();
+                const SilScore ss = silhouette_score(logits, cutout, cut_sz, cfg.seed_orientations, dd ? png.c_str() : nullptr);
+                c.sil = ss.iou; c.rot = ss.rot; c.sheet = sheet_fraction(logits);
+            }
+            cands.push_back(std::move(c));
+        }
+        size_t best = 0;
+        if (cands.size() > 1) {
+            // score = silhouette (best orientation) x (1 - sheet share), and 3% off when the
+            // structure only matches turned away from the input view: import scripts expect the
+            // object the way the image shows it, so an aligned seed wins a near-tie. (Agreement
+            // between candidates was tried and dropped: TRELLIS turns elongated objects -- arms --
+            // a different way per seed, so it measured orientation, not quality.)
+            for (size_t i = 0; i < cands.size(); ++i) {
+                cands[i].score = cands[i].sil * (1.0 - cands[i].sheet) * (cands[i].rot == 0 ? 1.0 : 0.97);
+                if (cands[i].score > cands[best].score) best = i;
+            }
+            printf("      seed        voxels  silhouette  sheet  score  orientation\n");
+            for (size_t i = 0; i < cands.size(); ++i)
+                printf("      %-10u %7zu     %.3f     %.3f  %.3f  %s%s\n", cands[i].seed, cands[i].coords.size(),
+                       cands[i].sil, cands[i].sheet, cands[i].score,
+                       cands[i].rot == 0 ? "as input   " : "turned     ", i == best ? "<- chosen" : "");
+            if (cands[best].rot != 0)
+                printf("      (the chosen structure is turned relative to the input view; the mesh is left as generated)\n");
+            run_seed = cands[best].seed;
+            rng = cands[best].rng; randn = cands[best].randn;
+            fprintf(stderr, "[trellis] seed search: chosen seed %u\n", run_seed);
+        }
+        coords = std::move(cands[best].coords);
     }
     if (cfg.voxply) { FILE*f=fopen("out/myvox.ply","wb"); fprintf(f,"ply\nformat binary_little_endian 1.0\nelement vertex %zu\nproperty float x\nproperty float y\nproperty float z\nelement face 0\nproperty list uchar int vertex_indices\nend_header\n",coords.size()); for(auto&c:coords){float p[3]={(c[0]+0.5f)/32-0.5f,(c[1]+0.5f)/32-0.5f,(c[2]+0.5f)/32-0.5f}; fwrite(p,4,3,f);} fclose(f); }
     printf("      active voxels @res32 = %d\n", (int)coords.size());
@@ -437,7 +614,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const trellis::FlowCond& c){ return run->forward(x, ts, c); };
         trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=cfg.gsh; sp.guidance_rescale=0.5f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=3.0f;
         vector<float> sn = trellis::sample_flow_multi(fwd, noise((size_t)32*n),
-                               view_conds(cnd, lc, pix ? pc.proj.data() : nullptr, cfg.multi_shape), multi_avg,
+                               view_conds(cnd, lc, pix ? pc.proj.data() : nullptr, cfg.multi_shape), multi_view,
                                trellis::FlowCond(ncnd, nullptr), sp);   // [32,n]
         delete run; m.free();
         return sn;
@@ -650,7 +827,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             };
             trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=1.0f; sp.guidance_rescale=0.0f; sp.gi0=0.6f; sp.gi1=0.9f; sp.rescale_t=3.0f;
             texlat = trellis::sample_flow_multi(fwd, noise((size_t)32*tN),
-                         view_conds(tcond, tlc, pix ? pc.proj.data() : nullptr, cfg.multi_tex), multi_avg,
+                         view_conds(tcond, tlc, pix ? pc.proj.data() : nullptr, cfg.multi_tex), multi_view,
                          trellis::FlowCond(tneg,  nullptr), sp);  // [32,tN]
             delete run; m.free();
             for (int n = 0; n < tN; ++n) for (int c = 0; c < 32; ++c) texlat[(size_t)c + 32*n] = texlat[(size_t)c + 32*n]*TEX_STD[c] + TEX_MEAN[c];
@@ -1001,6 +1178,14 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                    flipped.collision_rejections+smoothed.collision_rejections,
                    smoothed.maximum_displacement);
         }
+        if (cfg.cull_hidden) {
+            double area = 0;
+            const int before = (int)df.size()/3;
+            const int nd = trellis::drop_enclosed_faces(dv, df, 64, 2.0f, &area);
+            printf("  cull hidden: dropped %d of %d faces (%.1f%% of the area) that cannot be seen from outside\n",
+                   nd, before, area * 100.0);
+            fflush(stdout);
+        }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
         // Texels are shaded straight from the per-voxel PBR volume (trilinear sampling, the
         // reference bake behavior) rather than from decimation-averaged vertex colors, so
@@ -1010,14 +1195,41 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::BakedMesh bm = boxuv ? trellis::uv_box_project(dv, dV, df, dF, no_vp, T, &vox)
                                       : trellis::uv_bake(dv, dV, df, dF, no_vp, T, &vox);
         if (!boxuv && !bm.ok()) bm = trellis::uv_chart_project(dv, dV, df, dF, no_vp, T, &vox);
+        std::vector<uint8_t> normal_map;
+        if (bm.ok() && cfg.normal_map) {
+            // Detail maps from the dense surface the simplifier started from: the remeshed
+            // watertight shell when there is one (consistent winding), else the decoded mesh.
+            printf("  detail maps: normal%s from F=%d onto F=%d (atlas %d)\n",
+                   cfg.ao_rays > 0 ? (" + occlusion (" + std::to_string(cfg.ao_rays) + " rays)").c_str() : "",
+                   (int)sfaces.size()/3, (int)bm.faces.size()/3, bm.T);
+            fflush(stdout);
+            trellis::TriBvh hbvh = rm.F() > 0 ? trellis::TriBvh::build(sverts.data(), (int64_t)sverts.size()/3,
+                                                                       sfaces.data(), (int64_t)sfaces.size()/3)
+                                              : trellis::TriBvh();
+            trellis::DetailBakeParams dp;
+            dp.ao_rays = cfg.ao_rays; dp.ao_radius = cfg.ao_radius;
+            dp.ray_eps = 1.0f / (float)so.res;          // one voxel off the dense surface
+            dp.max_dist = 16.0f / (float)so.res;        // QEM moves the surface by a few voxels at most
+            const trellis::DetailBakeStats ds = trellis::bake_detail_maps(bm, sverts, sfaces,
+                                                                          rm.F() > 0 ? hbvh : bvh, dp, normal_map);
+            printf("  detail maps: %zu texels, %zu off the dense surface, mean occlusion %.3f, %.1fs\n",
+                   ds.texels, ds.missed, ds.mean_ao, ds.seconds);
+        }
         if (bm.ok()) {
             trellis::write_glb_textured(outglb.c_str(), bm.verts.data(), (int64_t)bm.verts.size()/3, bm.uv.data(),
                                         bm.faces.data(), (int64_t)bm.faces.size()/3, bm.base.data(), bm.mr.data(), bm.T,
                                         /*double_sided=*/rm.F() == 0, run_seed,
                                         cfg.copyright.empty() ? nullptr : cfg.copyright.c_str(),
-                                        /*use_webp=*/cfg.webp != 0);
+                                        /*use_webp=*/cfg.webp != 0,
+                                        normal_map.empty() ? nullptr : normal_map.data(),
+                                        /*mr_has_occlusion=*/!normal_map.empty() && cfg.ao_rays > 0);
             std::string tex = outglb.substr(0, outglb.find_last_of('.')) + "_base.png";
             stbi_write_png(tex.c_str(), bm.T, bm.T, 4, bm.base.data(), bm.T*4);
+            if (!normal_map.empty()) {
+                const std::string stem = outglb.substr(0, outglb.find_last_of('.'));
+                stbi_write_png((stem + "_normal.png").c_str(), bm.T, bm.T, 4, normal_map.data(), bm.T*4);
+                stbi_write_png((stem + "_orm.png").c_str(), bm.T, bm.T, 4, bm.mr.data(), bm.T*4);
+            }
             textured = true;
             printf("      textured GLB (atlas %d, +%s)\n", bm.T, tex.c_str());
         } else printf("      uv_bake failed; falling back to vertex colors\n");

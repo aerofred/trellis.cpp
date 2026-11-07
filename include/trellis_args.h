@@ -45,6 +45,13 @@ struct TrellisParams {
     // Shape from one clean view + texture from all of them keeps the silhouette of the main
     // view while the extra views only inform the colours of what it cannot see.
     bool multi_ss = true, multi_shape = true, multi_tex = true;
+    // Per-view weights, main view first (--view-weights 1,0.3): each view's share of the
+    // stochastic steps or of the multidiffusion mean. Missing entries count 1, 0 drops a view.
+    std::vector<float> view_weights;
+    // Flow-time window (1 = noise -> 0 = clean) where the extra views act (--multi-interval
+    // LO,HI); outside it the main view conditions alone. Early steps (t near 1) settle the
+    // overall shape, late ones the detail.
+    float multi_t_lo = 0.0f, multi_t_hi = 1.0f;
     std::string output = "model.glb";                           // output .glb
     std::string copyright;                                      // glTF asset.copyright metadata
     std::string models = "models";              // GGUF dir; override with --models DIR
@@ -57,6 +64,14 @@ struct TrellisParams {
     int threads = 0;            // CPU backend thread count; 0 = auto (all cores).
                                 // ggml's own default is GGML_DEFAULT_N_THREADS == 4.
     uint32_t seed = 0;
+    // Seed search (--seeds 42,7,123): run the sparse-structure stage once per seed, score each
+    // structure (silhouette vs the matte in its best right-angle orientation, stray flat sheets)
+    // and finish the best one only. Replaces `seed`.
+    std::vector<uint32_t> seeds;
+    // Orientations a seed-search candidate may take and still count (--seed-orientations):
+    // 0 any of the 24 right-angle turns, 1 upright (turned about the vertical axis only: a
+    // pipeline that assumes TRELLIS's up axis), 2 as the input view only.
+    int seed_orientations = 0;
 
     ModelFamily family = ModelFamily::Trellis;   // --model trellis|pixal3d
     // Pixal3D only. The projection needs the camera the image was "taken" with: upstream
@@ -101,6 +116,15 @@ struct TrellisParams {
                                 //   512, whose clean coarse PBR bakes onto the res-1024 mesh
                                 //   without the partial-coverage "skin" speckle); else force 512/1024
     int  webp     = -1;         // GLB texture encoding: -1 auto (WebP if built with it), 1 on, 0 off (PNG)
+    // Detail maps (--normal-map): bake the dense remeshed surface onto the simplified one as a
+    // tangent-space normal map (normalTexture) plus ambient occlusion in the R channel of the
+    // metallic-roughness image (occlusionTexture). See detail_bake.h.
+    bool  normal_map = false;
+    // --cull-hidden: drop the simplified mesh's faces that cannot be seen from outside (closed
+    // inner shells, enclosed sheets) before the UV unwrap, so the atlas only holds visible surface.
+    bool  cull_hidden = false;
+    int   ao_rays    = 32;      // occlusion rays per texel (0 = normal map only)
+    float ao_radius  = 0.05f;   // occlusion distance, fraction of the object's [-0.5,0.5] cube
     bool f32      = false;      // f32 sparse-conv compute
     bool no_fa    = false;      // disable FlashAttention (manual softmax)
     int  fa_fast  = -1;         // FA precision: -1 auto (fast on HTP), 0 BF16/F32, 1 F16/fast
@@ -182,6 +206,17 @@ bool check_faces_compat(const TrellisParams& p, std::string& error);
 bool parse_multi_mode_arg(const char* value, TrellisParams& p, std::string& error);
 // Comma list of ss, shape, tex, or all.
 bool parse_multi_stages_arg(const char* value, TrellisParams& p, std::string& error);
+// Comma list of non-negative weights, one per view, main view first ("1,0.3").
+bool parse_view_weights_arg(const char* value, TrellisParams& p, std::string& error);
+// Comma list of seeds for the seed search, each >= 1 ("42,7,123").
+bool parse_seeds_arg(const char* value, TrellisParams& p, std::string& error);
+// "any" | "upright" | "input".
+bool parse_seed_orientations_arg(const char* value, TrellisParams& p, std::string& error);
+// Detail-map knobs shared by --ao-rays / --ao-radius and the server fields of the same names.
+bool parse_ao_rays_arg(const char* value, TrellisParams& p, std::string& error);
+bool parse_ao_radius_arg(const char* value, TrellisParams& p, std::string& error);
+// "LO,HI" flow-time window, 0 <= LO <= HI <= 1 ("0,0.5": extra views only in the late steps).
+bool parse_multi_interval_arg(const char* value, TrellisParams& p, std::string& error);
 // Several views only work with the TRELLIS.2 flows (Pixal3D projects one camera view).
 // Call after all params are applied.
 bool check_multi_image_compat(const TrellisParams& p, std::string& error);

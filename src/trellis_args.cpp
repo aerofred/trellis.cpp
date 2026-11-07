@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <stdexcept>
+#include <vector>
 
 namespace trellis {
 
@@ -83,9 +84,105 @@ bool parse_multi_stages_arg(const char* value, TrellisParams& p, std::string& er
     return true;
 }
 
+// Comma-separated floats; false (with `error`) on an empty or malformed entry.
+static bool parse_float_list(const std::string& list, std::vector<float>& out, std::string& error) {
+    out.clear();
+    size_t s = 0;
+    while (s <= list.size()) {
+        size_t e = list.find(',', s);
+        if (e == std::string::npos) e = list.size();
+        const std::string w = list.substr(s, e - s);
+        try {
+            size_t used = 0;
+            const float f = std::stof(w, &used);
+            if (used != w.size() || !std::isfinite(f)) throw std::invalid_argument("trailing");
+            out.push_back(f);
+        } catch (...) { error = "not a number: '" + w + "'"; return false; }
+        s = e + 1;
+    }
+    return true;
+}
+
+bool parse_view_weights_arg(const char* value, TrellisParams& p, std::string& error) {
+    std::vector<float> w;
+    if (!parse_float_list(value, w, error)) { error = "view-weights: " + error; return false; }
+    float sum = 0;
+    for (float x : w) {
+        if (x < 0) { error = "view-weights must be >= 0"; return false; }
+        sum += x;
+    }
+    if (sum <= 0) { error = "view-weights: at least one weight must be > 0"; return false; }
+    p.view_weights = w;
+    return true;
+}
+
+bool parse_seeds_arg(const char* value, TrellisParams& p, std::string& error) {
+    std::vector<uint32_t> out;
+    const std::string list = value;
+    size_t s = 0;
+    while (s <= list.size()) {
+        size_t e = list.find(',', s);
+        if (e == std::string::npos) e = list.size();
+        const std::string w = list.substr(s, e - s);
+        try {
+            size_t used = 0;
+            const unsigned long long v = std::stoull(w, &used);
+            if (used != w.size() || v == 0 || v > 0xFFFFFFFFull) throw std::invalid_argument("range");
+            out.push_back((uint32_t)v);
+        } catch (...) { error = "seeds expects a comma list of integers >= 1, got '" + w + "'"; return false; }
+        s = e + 1;
+    }
+    p.seeds = out;
+    return true;
+}
+
+bool parse_ao_rays_arg(const char* value, TrellisParams& p, std::string& error) {
+    try {
+        size_t used = 0;
+        const int v = std::stoi(value, &used);
+        if (used != std::strlen(value) || v < 0 || v > 1024) throw std::invalid_argument("range");
+        p.ao_rays = v;
+        return true;
+    } catch (...) { error = std::string("ao-rays expects an integer 0..1024, got '") + value + "'"; return false; }
+}
+
+bool parse_ao_radius_arg(const char* value, TrellisParams& p, std::string& error) {
+    try {
+        size_t used = 0;
+        const float v = std::stof(value, &used);
+        if (used != std::strlen(value) || !(v > 0.0f) || v > 1.0f) throw std::invalid_argument("range");
+        p.ao_radius = v;
+        return true;
+    } catch (...) { error = std::string("ao-radius expects a number in (0, 1], got '") + value + "'"; return false; }
+}
+
+bool parse_seed_orientations_arg(const char* value, TrellisParams& p, std::string& error) {
+    const std::string v = value;
+    if      (v == "any")     p.seed_orientations = 0;
+    else if (v == "upright") p.seed_orientations = 1;
+    else if (v == "input")   p.seed_orientations = 2;
+    else { error = "seed-orientations expects any, upright or input, got '" + v + "'"; return false; }
+    return true;
+}
+
+bool parse_multi_interval_arg(const char* value, TrellisParams& p, std::string& error) {
+    std::vector<float> v;
+    if (!parse_float_list(value, v, error) || v.size() != 2 || v[0] < 0 || v[0] > v[1] || v[1] > 1) {
+        error = std::string("multi-interval expects LO,HI with 0 <= LO <= HI <= 1, got '") + value + "'";
+        return false;
+    }
+    p.multi_t_lo = v[0]; p.multi_t_hi = v[1];
+    return true;
+}
+
 bool check_multi_image_compat(const TrellisParams& p, std::string& error) {
     if (!p.extra_images.empty() && p.family == ModelFamily::Pixal3D) {
         error = "several input images need the trellis model (Pixal3D projects one camera view)";
+        return false;
+    }
+    if (p.view_weights.size() > 1 + p.extra_images.size()) {
+        error = "view-weights has " + std::to_string(p.view_weights.size()) + " entries for " +
+                std::to_string(1 + p.extra_images.size()) + " view(s)";
         return false;
     }
     return true;
@@ -120,6 +217,11 @@ void print_usage(const char* argv0, bool server) {
         "                          ss, shape, tex, or all (default all); the others are\n"
         "                          conditioned on the first image alone. tex keeps the main\n"
         "                          view's geometry and takes only colours from the others\n"
+        "      --view-weights LIST weight per view, main first (e.g. 1,0.3): its share of the\n"
+        "                          stochastic steps or of the multidiffusion mean (default 1)\n"
+        "      --multi-interval LO,HI  flow-time window where the extra views act (1 = noise,\n"
+        "                          0 = clean; default 0,1). 0,0.5 keeps the main view's\n"
+        "                          overall shape and lets the others refine the detail\n"
         "  -o, --output PATH       output .glb                  (default model.glb)\n"
         "      --copyright TEXT    glTF asset.copyright metadata\n"
         "  -m, --models DIR        GGUF model directory\n"
@@ -159,6 +261,16 @@ void print_usage(const char* argv0, bool server) {
         "                          while a backend compute is running (TRELLIS_VERBOSE=1;\n"
         "                          =2 also dumps the per-op histogram of each graph)\n"
         "  -s, --seed N            RNG seed                     (default 42)\n"
+        "      --seeds LIST        seed search, e.g. 42,7,123: the sparse structure is sampled\n"
+        "                          for each seed (a few seconds each) and scored: silhouette\n"
+        "                          vs the matte (in the best of 24 right-angle orientations,\n"
+        "                          an aligned one preferred) and share of stray one-voxel\n"
+        "                          sheets. Only the best is finished; the output is identical\n"
+        "                          to --seed <chosen>, which is printed\n"
+        "      --seed-orientations any|upright|input\n"
+        "                          orientations a candidate is scored in (default any; upright =\n"
+        "                          turned about the vertical axis only, for pipelines that rely\n"
+        "                          on TRELLIS's up axis; input = as the image shows it)\n"
         "      --steps N           flow sampler steps (default 12). Lower is faster and\n"
         "                          rougher; useful for backend bring-up, where a CPU and\n"
         "                          an NPU run at the same N stay directly comparable.\n"
@@ -185,6 +297,16 @@ void print_usage(const char* argv0, bool server) {
         "                          a dense res-1024 decode to a clean res-512 PBR volume)\n"
         "      --webp on|off       encode GLB textures as WebP (default: on when built with\n"
         "                          WebP support; off = PNG)\n"
+        "      --normal-map        bake the dense surface onto the simplified mesh: tangent-\n"
+        "                          space normal map (normalTexture, PNG, +<out>_normal.png) and\n"
+        "                          ambient occlusion in the R channel of the metallic-roughness\n"
+        "                          image (occlusionTexture). Pair with --faces for a game asset.\n"
+        "                          Frame: T = dP/du, B = dP/dv, N = smooth vertex normal\n"
+        "      --cull-hidden       drop faces that cannot be seen from outside (inner shells,\n"
+        "                          enclosed sheets) before the UV unwrap: the atlas then only\n"
+        "                          holds visible surface\n"
+        "      --ao-rays N         occlusion rays per texel for --normal-map (default 32; 0 = none)\n"
+        "      --ao-radius F       occlusion distance, fraction of the object size (default 0.05)\n"
         "      --dump-bg           also write the background-removal cutout as <out>_cutout.png\n"
         "      --dump-post PATH    write the raw decoded mesh + sparse PBR volume to PATH and\n"
         "                          exit (skips remesh/decimate/UV/bake/GLB) -- for external\n"
@@ -237,11 +359,14 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         if      (a == "-h" || a == "--help")    { p.help = true; return false; }
         else if (a == "-i" || a == "--image")   { const char* v = need(a.c_str()); if (!v) return false;
                                                   if (p.image.empty()) p.image = v; else p.extra_images.push_back(v); }
-        else if (a == "--multi-mode" || a == "--multi-stages") {
+        else if (a == "--multi-mode" || a == "--multi-stages" || a == "--view-weights" || a == "--multi-interval") {
                                                   const char* v = need(a.c_str()); if (!v) return false;
                                                   std::string error;
-                                                  if (!(a == "--multi-mode" ? parse_multi_mode_arg(v, p, error)
-                                                                            : parse_multi_stages_arg(v, p, error))) {
+                                                  const bool ok = a == "--multi-mode"   ? parse_multi_mode_arg(v, p, error)
+                                                                : a == "--multi-stages" ? parse_multi_stages_arg(v, p, error)
+                                                                : a == "--view-weights" ? parse_view_weights_arg(v, p, error)
+                                                                                        : parse_multi_interval_arg(v, p, error);
+                                                  if (!ok) {
                                                       fprintf(stderr, "[trellis] %s\n", error.c_str()); return false;
                                                   } }
         else if (a == "-o" || a == "--output")  { const char* v = need(a.c_str()); if (!v) return false; p.output = v; }
@@ -271,6 +396,12 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   else { fprintf(stderr, "[trellis] --sched expects on or off\n"); return false; } }
         else if (a == "--vulkan-fallback")      { p.vulkan_fallback = 1; }
         else if (a == "--no-vulkan-fallback")   { p.vulkan_fallback = 0; }
+        else if (a == "--seeds" || a == "--seed-orientations") {
+                                                  const char* v = need(a.c_str()); if (!v) return false;
+                                                  std::string error;
+                                                  if (!(a == "--seeds" ? parse_seeds_arg(v, p, error) : parse_seed_orientations_arg(v, p, error))) {
+                                                      fprintf(stderr, "[trellis] %s\n", error.c_str()); return false;
+                                                  } }
         else if (a == "-s" || a == "--seed")    { const char* v = need(a.c_str()); if (!v) return false; p.seed = (uint32_t)atoi(v); }
         else if (a == "--res")                  { const char* v = need(a.c_str()); if (!v) return false; p.set_res(atoi(v)); }
         else if (a == "--max-tokens")           { const char* v = need(a.c_str()); if (!v) return false; p.max_tokens = atoi(v); }
@@ -287,6 +418,14 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   if (!parse_faces_arg(v, p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; } }
         else if (a == "--atlas" || a == "--tex"){ const char* v = need(a.c_str()); if (!v) return false; p.tex = atoi(v); }
         else if (a == "--tex-res")              { const char* v = need(a.c_str()); if (!v) return false; p.tex_res = atoi(v); }
+        else if (a == "--normal-map")           { p.normal_map = true; }
+        else if (a == "--cull-hidden")          { p.cull_hidden = true; }
+        else if (a == "--ao-rays" || a == "--ao-radius") {
+                                                  const char* v = need(a.c_str()); if (!v) return false;
+                                                  std::string error;
+                                                  if (!(a == "--ao-rays" ? parse_ao_rays_arg(v, p, error) : parse_ao_radius_arg(v, p, error))) {
+                                                      fprintf(stderr, "[trellis] %s\n", error.c_str()); return false;
+                                                  } }
         else if (a == "--webp")                 { const char* v = need(a.c_str()); if (!v) return false;
                                                   p.webp = (std::strcmp(v,"off")==0 || std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0) ? 0
                                                          : (std::strcmp(v,"on")==0 || std::strcmp(v,"1")==0 || std::strcmp(v,"true")==0) ? 1 : -1; }

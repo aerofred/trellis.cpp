@@ -109,6 +109,7 @@ add_library(trellis_core STATIC
   thirdparty/xatlas/xatlas.cpp
   thirdparty/meshoptimizer/simplifier.cpp
   src/tri_bvh.cpp
+  src/detail_bake.cpp
   src/remesh_dc.cpp
   src/decimate_qem.cpp
   src/mesh_shape.cpp

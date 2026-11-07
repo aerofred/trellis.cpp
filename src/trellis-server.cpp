@@ -4,8 +4,9 @@
 //   POST /generate    multipart/form-data with an "image" file part (repeat it for
 //                      more views of the same object, main view first; trellis model
 //                      only, combined per "multi_mode" = stochastic|multidiffusion and
-//                      "multi_stages" = comma list of ss,shape,tex or all); optional text
-//                      fields "seed", "resolution" (512/1024/1536), "bg_removal"
+//                      "multi_stages" = comma list of ss,shape,tex or all, "view_weights"
+//                      = comma list, main view first, "multi_interval" = LO,HI); optional text
+//                      fields "seed", "seeds" (comma list: seed search), "resolution" (512/1024/1536), "bg_removal"
 //                      (threshold|birefnet), "uv" (xatlas = default, unique
 //                      chart space; box = faster projection), "band" (narrow-band
 //                      DC remesh band width, default 1 — see --band), "model"
@@ -111,6 +112,17 @@ int main(int argc, char** argv) {
         // Per-request params start from the launch defaults, then apply overrides.
         trellis::TrellisParams p = base;
         if (req.has_file("seed")) p.seed = (uint32_t) atoi(req.get_file_value("seed").content.c_str());
+        for (const char* field : {"seeds", "seed_orientations"}) {
+            if (!req.has_file(field)) continue;
+            std::string error;
+            const std::string v = req.get_file_value(field).content;
+            if (!(std::string(field) == "seeds" ? trellis::parse_seeds_arg(v.c_str(), p, error)
+                                                : trellis::parse_seed_orientations_arg(v.c_str(), p, error))) {
+                res.status = 400;
+                res.set_content(error + "\n", "text/plain");
+                return;
+            }
+        }
         if (req.has_file("resolution")) p.set_res(atoi(req.get_file_value("resolution").content.c_str()));
         if (req.has_file("bg_removal")) p.birefnet = (req.get_file_value("bg_removal").content == "birefnet") ? 1 : 0;
         if (req.has_file("uv")) p.xatlas = (req.get_file_value("uv").content == "xatlas");
@@ -155,12 +167,35 @@ int main(int argc, char** argv) {
             p.webp = (w == "off" || w == "0" || w == "false") ? 0
                    : (w == "on"  || w == "1" || w == "true")  ? 1 : -1;
         }
-        for (const char* field : {"multi_mode", "multi_stages"}) {
+        for (const char* field : {"normal_map", "cull_hidden"}) {
+            if (!req.has_file(field)) continue;
+            const std::string& w = req.get_file_value(field).content;
+            bool& target = std::string(field) == "normal_map" ? p.normal_map : p.cull_hidden;
+            if      (w == "on"  || w == "1" || w == "true")  target = true;
+            else if (w == "off" || w == "0" || w == "false") target = false;
+            else { res.status = 400; res.set_content(std::string(field) + " must be on or off\n", "text/plain"); return; }
+        }
+        for (const char* field : {"ao_rays", "ao_radius"}) {
             if (!req.has_file(field)) continue;
             const std::string v = req.get_file_value(field).content;
             std::string error;
-            if (!(std::string(field) == "multi_mode" ? trellis::parse_multi_mode_arg(v.c_str(), p, error)
-                                                     : trellis::parse_multi_stages_arg(v.c_str(), p, error))) {
+            if (!(std::string(field) == "ao_rays" ? trellis::parse_ao_rays_arg(v.c_str(), p, error)
+                                                  : trellis::parse_ao_radius_arg(v.c_str(), p, error))) {
+                res.status = 400;
+                res.set_content(error + "\n", "text/plain");
+                return;
+            }
+        }
+        for (const char* field : {"multi_mode", "multi_stages", "view_weights", "multi_interval"}) {
+            if (!req.has_file(field)) continue;
+            const std::string v = req.get_file_value(field).content;
+            const std::string f = field;
+            std::string error;
+            const bool ok = f == "multi_mode"   ? trellis::parse_multi_mode_arg(v.c_str(), p, error)
+                          : f == "multi_stages" ? trellis::parse_multi_stages_arg(v.c_str(), p, error)
+                          : f == "view_weights" ? trellis::parse_view_weights_arg(v.c_str(), p, error)
+                                                : trellis::parse_multi_interval_arg(v.c_str(), p, error);
+            if (!ok) {
                 res.status = 400;
                 res.set_content(error + "\n", "text/plain");
                 return;

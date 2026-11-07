@@ -77,15 +77,26 @@ std::vector<float> sample_flow(const FlowFwd& fwd, std::vector<float> sample,
                                const SamplerParams& sp,
                                std::vector<std::vector<float>>* trace = nullptr);
 
-// Several views of one object (TRELLIS v1's multi-image samplers). `conds` holds one positive
-// branch per view, all with the runner's token count; `neg_cond` is shared (it is image-free).
-//   average == false  "stochastic": step i is conditioned on view i % N alone (both CFG
-//                     branches), so a run costs exactly what a single-image run costs.
-//   average == true   "multidiffusion": every step averages the conditional velocities of all
-//                     N views before guidance; N (+1 when guided) forwards per step.
-// With one view both reduce to sample_flow.
+// How sample_flow_multi combines several views (TRELLIS v1's multi-image samplers).
+//   average == false  "stochastic": each step is conditioned on ONE view (both CFG branches),
+//                     chosen by weighted round-robin, so a run costs what a single image costs.
+//   average == true   "multidiffusion": each step takes the weighted mean of every view's
+//                     conditional velocity before guidance; N (+1 when guided) forwards per step.
+// `weights` (one per view, missing = 1, 0 = unused) set each view's share of the steps or of
+// the mean. The extra views only act while the flow time t (1 = noise -> 0 = clean) lies in
+// [t_lo, t_hi]; outside it the first view conditions alone. Early steps (high t) settle the
+// overall shape, late ones the detail.
+struct MultiView {
+    bool average = false;
+    std::vector<float> weights;
+    float t_lo = 0.0f, t_hi = 1.0f;
+};
+
+// Several views of one object. `conds` holds one positive branch per view, all with the
+// runner's token count; `neg_cond` is shared (it is image-free). With one view this is
+// sample_flow.
 std::vector<float> sample_flow_multi(const FlowFwd& fwd, std::vector<float> sample,
-                                     const std::vector<FlowCond>& conds, bool average,
+                                     const std::vector<FlowCond>& conds, const MultiView& mv,
                                      const FlowCond& neg_cond, const SamplerParams& sp,
                                      std::vector<std::vector<float>>* trace = nullptr);
 

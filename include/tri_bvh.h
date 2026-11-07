@@ -24,6 +24,9 @@ public:
     Hit closest_filtered(const float p[3], PointFilter accept, void *context, float max_dist) const;
     using BoxVisitor = bool (*)(void *, int32_t);
     bool visit_overlapping(const float bmin[3], const float bmax[3], BoxVisitor visit, void *context) const;
+    // Any-hit ray query: true when the ray o + t*d (d need not be unit) meets a triangle for
+    // some t in (0, tmax]. Both faces count. Used by the ambient-occlusion bake.
+    bool occluded(const float o[3], const float d[3], float tmax) const;
     bool empty() const { return nodes_.empty(); }
 
 private:
