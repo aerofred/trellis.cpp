@@ -8,6 +8,7 @@
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
   #include <hip/hip_runtime.h>
   #define cudaSetDevice           hipSetDevice
+  #define cudaGetDeviceCount      hipGetDeviceCount
   #define cudaMalloc              hipMalloc
   #define cudaFree                hipFree
   #define cudaMemcpy              hipMemcpy
@@ -70,7 +71,12 @@ void deform_conv2d_run(const float* x, int Cin, int H, int W,
                        const float* offset, const float* mask,
                        const float* weight, const float* bias, int Cout, int K,
                        float* out, int gpu) {
-    cudaSetDevice(gpu < 0 ? 0 : gpu);   // deform always runs on a real GPU even if the model is on CPU
+    // Deform always runs on a real GPU even if the model is on CPU. The buffers are host-side, so
+    // any device works: an out-of-range --gpu (Model::load falls back the same way) uses device 0.
+    // A failed cudaSetDevice would otherwise linger as the last error and abort ggml's next op.
+    int n_dev = 0;
+    if (cudaGetDeviceCount(&n_dev) != cudaSuccess || gpu < 0 || gpu >= n_dev) gpu = 0;
+    cudaSetDevice(gpu);
     long HW = (long)H * W;
     size_t sx = (size_t)Cin * HW * sizeof(float);
     size_t soff = (size_t)2 * K * K * HW * sizeof(float);

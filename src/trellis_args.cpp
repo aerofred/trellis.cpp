@@ -56,6 +56,41 @@ bool check_faces_compat(const TrellisParams& p, std::string& error) {
     return true;
 }
 
+bool parse_multi_mode_arg(const char* value, TrellisParams& p, std::string& error) {
+    const std::string v = value;
+    if      (v == "stochastic")     p.multi_mode = MultiImageMode::Stochastic;
+    else if (v == "multidiffusion") p.multi_mode = MultiImageMode::MultiDiffusion;
+    else { error = "unknown multi-mode: " + v + " (stochastic|multidiffusion)"; return false; }
+    return true;
+}
+
+bool parse_multi_stages_arg(const char* value, TrellisParams& p, std::string& error) {
+    bool ss = false, shape = false, tex = false;
+    const std::string list = value;
+    size_t s = 0;
+    while (s <= list.size()) {
+        size_t e = list.find(',', s);
+        if (e == std::string::npos) e = list.size();
+        const std::string w = list.substr(s, e - s);
+        if      (w == "ss")    ss = true;
+        else if (w == "shape") shape = true;
+        else if (w == "tex")   tex = true;
+        else if (w == "all")   ss = shape = tex = true;
+        else { error = "unknown multi-stages entry: " + w + " (ss|shape|tex|all)"; return false; }
+        s = e + 1;
+    }
+    p.multi_ss = ss; p.multi_shape = shape; p.multi_tex = tex;
+    return true;
+}
+
+bool check_multi_image_compat(const TrellisParams& p, std::string& error) {
+    if (!p.extra_images.empty() && p.family == ModelFamily::Pixal3D) {
+        error = "several input images need the trellis model (Pixal3D projects one camera view)";
+        return false;
+    }
+    return true;
+}
+
 const char* model_family_name(ModelFamily f) {
     return f == ModelFamily::Pixal3D ? "pixal3d" : "trellis";
 }
@@ -73,7 +108,18 @@ void print_usage(const char* argv0, bool server) {
     }
     fprintf(stderr,
         "\n"
-        "  -i, --image PATH        input image                  (image->3D)\n"
+        "  -i, --image PATH        input image                  (image->3D). Repeat it to give\n"
+        "                          more views of the same object (front, back, side...): each\n"
+        "                          flow stage is then conditioned on all of them\n"
+        "      --multi-mode MODE   how several -i views are combined (trellis model only):\n"
+        "                          stochastic (default) -- one view per sampler step, in turn;\n"
+        "                          same cost as one image.\n"
+        "                          multidiffusion -- every step averages all views; N x the\n"
+        "                          conditional flow forwards, usually the more faithful\n"
+        "      --multi-stages LIST which flow stages use every view: comma list of\n"
+        "                          ss, shape, tex, or all (default all); the others are\n"
+        "                          conditioned on the first image alone. tex keeps the main\n"
+        "                          view's geometry and takes only colours from the others\n"
         "  -o, --output PATH       output .glb                  (default model.glb)\n"
         "      --copyright TEXT    glTF asset.copyright metadata\n"
         "  -m, --models DIR        GGUF model directory\n"
@@ -189,7 +235,15 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         };
 
         if      (a == "-h" || a == "--help")    { p.help = true; return false; }
-        else if (a == "-i" || a == "--image")   { const char* v = need(a.c_str()); if (!v) return false; p.image = v; }
+        else if (a == "-i" || a == "--image")   { const char* v = need(a.c_str()); if (!v) return false;
+                                                  if (p.image.empty()) p.image = v; else p.extra_images.push_back(v); }
+        else if (a == "--multi-mode" || a == "--multi-stages") {
+                                                  const char* v = need(a.c_str()); if (!v) return false;
+                                                  std::string error;
+                                                  if (!(a == "--multi-mode" ? parse_multi_mode_arg(v, p, error)
+                                                                            : parse_multi_stages_arg(v, p, error))) {
+                                                      fprintf(stderr, "[trellis] %s\n", error.c_str()); return false;
+                                                  } }
         else if (a == "-o" || a == "--output")  { const char* v = need(a.c_str()); if (!v) return false; p.output = v; }
         else if (a == "--copyright")            { const char* v = need(a.c_str()); if (!v) return false; p.copyright = v; }
         else if (a == "-m" || a == "--models")  { const char* v = need(a.c_str()); if (!v) return false; p.models = v; }
@@ -262,7 +316,8 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--voxply")               { p.voxply = true; }
         else if (a == "--dump-slat")            { p.dump_slat = true; }
         else if (!a.empty() && a[0] == '-')     { fprintf(stderr, "[trellis] unknown option: %s\n", a.c_str()); return false; }
-        else if (positional == 0)               { p.image  = a; positional = 1; }
+        else if (positional == 0)               { if (p.image.empty()) p.image = a; else p.extra_images.push_back(a);
+                                                  positional = 1; }
         else if (positional == 1)               { p.output = a; positional = 2; }
         else                                    { fprintf(stderr, "[trellis] unexpected argument: %s\n", a.c_str()); return false; }
     }
@@ -276,6 +331,10 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
     {
         std::string error;
         if (!check_faces_compat(p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
+    }
+    {
+        std::string error;
+        if (!check_multi_image_compat(p, error)) { fprintf(stderr, "[trellis] %s\n", error.c_str()); return false; }
     }
     if (!p.retopo && p.retopo_no_weld_fill) {
         fprintf(stderr,"[trellis] --retopo-no-weld-fill requires --retopo\n");

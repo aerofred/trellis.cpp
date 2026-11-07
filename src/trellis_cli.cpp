@@ -24,6 +24,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <memory>
+#include <utility>
 #include <random>
 #include <vector>
 #include <string>
@@ -216,60 +218,88 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     auto noise = [&](size_t n){ vector<float> v(n); for (auto& x : v) x = randn(rng); return v; };
     double t0 = now();
 
-    bool birefnet = cfg.birefnet == 1;
-    if (cfg.birefnet < 0) {
-        // Auto bg-removal. A pre-matted image keeps its own alpha (threshold path uses it
-        // as-is). Otherwise prefer the neural matte: the white-threshold rule reads specular
-        // highlights (min(RGB)>=232) as background, and conditioning the flow on an object
-        // with punched-out highlights makes it generate HOLES right there (issue #1
-        // follow-ups: helmet-crest and axe-edge highlights on assets/goblin.png).
-        if (trellis::image_has_alpha(img)) {
-            birefnet = false;
-        } else {
-            FILE* bf = fopen((M + "/birefnet.gguf").c_str(), "rb");
-            if (bf) { fclose(bf); birefnet = true; }
-            else printf("      (birefnet.gguf not found -- falling back to threshold matte;"
-                        " bright highlights may punch holes)\n");
-        }
-    }
-    vector<float> chw, chw1024;
-    std::vector<unsigned char> cutout; int cut_sz = 0;   // the bg-removal result (for --dump-bg / --bg-only)
-    if (birefnet) {
-        printf("[1/6] preprocess %s (BiRefNet bg removal, %s)\n", img.c_str(), cascade ? "1024 cascade" : "512");
-        // Full BiRefNet (Swin-L backbone + deformable-conv decoder) runs on the GPU. Cutout computed
-        // once, normalized for 512 and 1024.
-        // BiRefNet's small convolutions are slower and currently nondeterministic on HTP.
-        // Keep other explicitly selected backends on their existing path.
-        const std::string bg_saved_backend = trellis::g_backend;
-        const bool bg_on_cpu = backend_is_htp(requested_backend);
-        if (bg_on_cpu) trellis::g_backend = "CPU";
-        trellis::Model bm = trellis::Model::load(M + "/birefnet.gguf",
-                                                 bg_on_cpu ? -1 : gpu);
-        trellis::g_backend = bg_saved_backend;
-        cutout = trellis::birefnet_cutout(img, bm, gpu < 0 ? 0 : gpu, cut_sz);
-        bm.free();
-        if (cutout.empty()) return 1;
-        chw = trellis::normalize_cutout(cutout, cut_sz, 512);
-        if (cascade) chw1024 = trellis::normalize_cutout(cutout, cut_sz, 1024);
-    } else {
-        printf("[1/6] preprocess %s (%s)\n", img.c_str(), cascade ? "1024 cascade" : "512");
-        cutout = trellis::threshold_cutout(img, cut_sz);
-        if (cutout.empty()) return 1;
-        chw = trellis::normalize_cutout(cutout, cut_sz, 512);
-        if (cascade) chw1024 = trellis::normalize_cutout(cutout, cut_sz, 1024);
-    }
+    // Every view goes through the same preprocessing; view 0 is `img`. Several views are only
+    // accepted for TRELLIS.2 (parse_args), so the Pixal3D paths below only ever see one.
+    vector<std::string> views{ img };
+    views.insert(views.end(), cfg.extra_images.begin(), cfg.extra_images.end());
+    const int n_views = (int)views.size();
+    if (n_views > 1 && pix) { fprintf(stderr, "[trellis] several input images need --model trellis\n"); return 1; }
+    if (n_views > 1)
+        printf("[trellis] %d views, %s, stages:%s%s%s\n", n_views,
+               cfg.multi_mode == trellis::MultiImageMode::MultiDiffusion ? "multidiffusion" : "stochastic",
+               cfg.multi_ss ? " ss" : "", cfg.multi_shape ? " shape" : "", cfg.multi_tex ? " tex" : "");
 
-    // --dump-bg: write the bg-removal cutout next to the output; --bg-only: stop here.
-    if (cfg.dump_bg || cfg.bg_only) {
-        const std::string cut_png = outglb.substr(0, outglb.find_last_of('.')) + "_cutout.png";
-        const int cut_channels = cut_sz > 0 && cutout.size() == (size_t)cut_sz * cut_sz * 4 ? 4 : 3;
-        if (cut_sz > 0 && stbi_write_png(cut_png.c_str(), cut_sz, cut_sz, cut_channels,
-                                        cutout.data(), cut_sz*cut_channels))
-            printf("      bg-removal cutout -> %s\n", cut_png.c_str());
-        else
-            fprintf(stderr, "      [warn] could not write bg-removal cutout to %s\n", cut_png.c_str());
-        if (cfg.bg_only) { printf("[bg-only] done (%.1fs)\n", now() - t0); return 0; }
+    bool have_birefnet = false;
+    if (cfg.birefnet < 0) {
+        FILE* bf = fopen((M + "/birefnet.gguf").c_str(), "rb");
+        if (bf) { fclose(bf); have_birefnet = true; }
     }
+    // Loaded on first use, then kept for the remaining views.
+    std::unique_ptr<trellis::Model> bmodel;
+    auto birefnet_model = [&]() -> trellis::Model& {
+        if (!bmodel) {
+            // BiRefNet's small convolutions are slower and currently nondeterministic on HTP.
+            // Keep other explicitly selected backends on their existing path.
+            const std::string bg_saved_backend = trellis::g_backend;
+            const bool bg_on_cpu = backend_is_htp(requested_backend);
+            if (bg_on_cpu) trellis::g_backend = "CPU";
+            bmodel = std::make_unique<trellis::Model>(trellis::Model::load(M + "/birefnet.gguf",
+                                                                           bg_on_cpu ? -1 : gpu));
+            trellis::g_backend = bg_saved_backend;
+        }
+        return *bmodel;
+    };
+    vector<vector<float>> chw_v((size_t)n_views), chw1024_v((size_t)n_views);
+    std::vector<unsigned char> cutout; int cut_sz = 0;   // view 0's bg-removal result (Pixal3D's NAF guide)
+    for (int v = 0; v < n_views; ++v) {
+        const std::string& vimg = views[(size_t)v];
+        const std::string step = n_views > 1 ? "[1/6] preprocess view " + std::to_string(v) + ": " : "[1/6] preprocess ";
+        bool birefnet = cfg.birefnet == 1;
+        if (cfg.birefnet < 0) {
+            // Auto bg-removal. A pre-matted image keeps its own alpha (threshold path uses it
+            // as-is). Otherwise prefer the neural matte: the white-threshold rule reads specular
+            // highlights (min(RGB)>=232) as background, and conditioning the flow on an object
+            // with punched-out highlights makes it generate HOLES right there (issue #1
+            // follow-ups: helmet-crest and axe-edge highlights on assets/goblin.png).
+            if (trellis::image_has_alpha(vimg)) {
+                birefnet = false;
+            } else {
+                birefnet = have_birefnet;
+                if (!birefnet)
+                    printf("      (birefnet.gguf not found -- falling back to threshold matte;"
+                           " bright highlights may punch holes)\n");
+            }
+        }
+        std::vector<unsigned char> cut; int csz = 0;
+        if (birefnet) {
+            printf("%s%s (BiRefNet bg removal, %s)\n", step.c_str(), vimg.c_str(), cascade ? "1024 cascade" : "512");
+            // Full BiRefNet (Swin-L backbone + deformable-conv decoder) runs on the GPU. Cutout
+            // computed once, normalized for 512 and 1024.
+            cut = trellis::birefnet_cutout(vimg, birefnet_model(), gpu < 0 ? 0 : gpu, csz);
+        } else {
+            printf("%s%s (%s)\n", step.c_str(), vimg.c_str(), cascade ? "1024 cascade" : "512");
+            cut = trellis::threshold_cutout(vimg, csz);
+        }
+        if (cut.empty()) return 1;
+        chw_v[(size_t)v] = trellis::normalize_cutout(cut, csz, 512);
+        if (cascade) chw1024_v[(size_t)v] = trellis::normalize_cutout(cut, csz, 1024);
+
+        // --dump-bg: write the bg-removal cutout next to the output (view k > 0 as
+        // <out>_cutout<k>.png); --bg-only: stop after the last view.
+        if (cfg.dump_bg || cfg.bg_only) {
+            const std::string cut_png = outglb.substr(0, outglb.find_last_of('.')) + "_cutout" +
+                                        (v ? std::to_string(v) : std::string()) + ".png";
+            const int cut_channels = csz > 0 && cut.size() == (size_t)csz * csz * 4 ? 4 : 3;
+            if (csz > 0 && stbi_write_png(cut_png.c_str(), csz, csz, cut_channels,
+                                          cut.data(), csz*cut_channels))
+                printf("      bg-removal cutout -> %s\n", cut_png.c_str());
+            else
+                fprintf(stderr, "      [warn] could not write bg-removal cutout to %s\n", cut_png.c_str());
+        }
+        if (v == 0) { cutout = std::move(cut); cut_sz = csz; }
+    }
+    if (bmodel) { bmodel->free(); bmodel.reset(); }
+    if (cfg.bg_only) { printf("[bg-only] done (%.1fs)\n", now() - t0); return 0; }
 
     // Raw [0,1] guides for NAF. The DINOv3 branch wants the ImageNet-normalized tensor; NAF's
     // image encoder wants the unnormalized one, so both are kept.
@@ -280,23 +310,36 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     }
 
     printf("[2/6] DINOv3 conditioning\n");
-    vector<float> dino, dino1024;       // full token stream: 5 global + (S/16)^2 patches
+    vector<float> dino, dino1024;       // view 0's full token stream: 5 global + (S/16)^2 patches
+    vector<float> cond, cond1024;       // cross-attention context of every view, back to back
     { trellis::Model m = trellis::Model::load(M + "/dinov3.gguf", gpu);
-      dino = trellis::dinov3_encode(m, chw, 512);
-      if (cascade) dino1024 = trellis::dinov3_encode(m, chw1024, 1024);
+      for (int v = 0; v < n_views; ++v) {
+          vector<float> d = trellis::dinov3_encode(m, chw_v[(size_t)v], 512);
+          vector<float> d1024;
+          if (cascade) d1024 = trellis::dinov3_encode(m, chw1024_v[(size_t)v], 1024);
+          // TRELLIS.2 cross-attends over every token. Pixal3D cross-attends over the 5 global
+          // tokens (cls + registers) only and routes the patch grid through the projection
+          // branch instead, so the cross-attention context is just a prefix of the same tensor.
+          constexpr size_t N_GLOBAL_FLOAT = 5 * 1024;
+          cond.insert(cond.end(), d.begin(), pix ? d.begin() + N_GLOBAL_FLOAT : d.end());
+          if (cascade) cond1024.insert(cond1024.end(), d1024.begin(), pix ? d1024.begin() + N_GLOBAL_FLOAT : d1024.end());
+          if (v == 0) { dino = std::move(d); dino1024 = std::move(d1024); }
+      }
       m.free(); }
-    // TRELLIS.2 cross-attends over every token. Pixal3D cross-attends over the 5 global tokens
-    // (cls + registers) only and routes the patch grid through the projection branch instead, so
-    // the cross-attention context is just a prefix of the same tensor.
-    constexpr size_t N_GLOBAL_FLOAT = 5 * 1024;
-    vector<float> cond    = pix ? vector<float>(dino.begin(), dino.begin() + N_GLOBAL_FLOAT) : dino;
-    vector<float> cond1024;
-    if (cascade)
-        cond1024 = pix ? vector<float>(dino1024.begin(), dino1024.begin() + N_GLOBAL_FLOAT) : dino1024;
-    const int Lc = (int)(cond.size() / 1024);
-    vector<float> neg(cond.size(), 0.0f);
-    const int Lc1024 = cascade ? (int)(cond1024.size() / 1024) : 0;
-    vector<float> neg1024(cond1024.size(), 0.0f);
+    vector<vector<float>>().swap(chw_v); vector<vector<float>>().swap(chw1024_v);
+    // Per-view token counts: every view is encoded at the same size, so they all match.
+    const int Lc = (int)(cond.size() / 1024 / n_views);
+    vector<float> neg((size_t)Lc * 1024, 0.0f);
+    const int Lc1024 = cascade ? (int)(cond1024.size() / 1024 / n_views) : 0;
+    vector<float> neg1024((size_t)Lc1024 * 1024, 0.0f);
+    // The positive CFG branch of each view; `proj` (Pixal3D, single view only) rides on view 0.
+    const bool multi_avg = cfg.multi_mode == trellis::MultiImageMode::MultiDiffusion;
+    auto view_conds = [&](const float* all, int lc, const float* proj, bool use_all) {
+        vector<trellis::FlowCond> cs;
+        for (int v = 0; v < (use_all ? n_views : 1); ++v)
+            cs.emplace_back(all + (size_t)v * lc * 1024, v == 0 ? proj : nullptr);
+        return cs;
+    };
     printf("      cond tokens=%d%s\n", Lc, cascade ? (" / 1024-cond tokens=" + std::to_string(Lc1024)).c_str() : "");
     slat_stats("cond_512 (DINOv3@512)", cond);
     if (cascade) slat_stats("cond_1024 (DINOv3@1024)", cond1024);
@@ -347,8 +390,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::DitRunner* run = trellis::make_dense_runner(m, p, 16, Lc);
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const trellis::FlowCond& c){ return run->forward(x, ts, c); };
         trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=cfg.gss; sp.guidance_rescale=0.7f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=5.0f;
-        vector<float> z = trellis::sample_flow(fwd, noise(8*4096),
-                              trellis::FlowCond(cond.data(), pix ? pc.proj.data()     : nullptr),
+        vector<float> z = trellis::sample_flow_multi(fwd, noise(8*4096),
+                              view_conds(cond.data(), Lc, pix ? pc.proj.data() : nullptr, cfg.multi_ss), multi_avg,
                               trellis::FlowCond(neg.data(),  nullptr), sp);  // [8,4096] ne0=8
         delete run; m.free();
         // transpose [8,L] -> torch [8,16,16,16] memory (c*4096 + sp)
@@ -393,8 +436,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::DitRunner* run = trellis::make_sparse_runner(m, p, cds, lc);
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const trellis::FlowCond& c){ return run->forward(x, ts, c); };
         trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=cfg.gsh; sp.guidance_rescale=0.5f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=3.0f;
-        vector<float> sn = trellis::sample_flow(fwd, noise((size_t)32*n),
-                               trellis::FlowCond(cnd,  pix ? pc.proj.data()     : nullptr),
+        vector<float> sn = trellis::sample_flow_multi(fwd, noise((size_t)32*n),
+                               view_conds(cnd, lc, pix ? pc.proj.data() : nullptr, cfg.multi_shape), multi_avg,
                                trellis::FlowCond(ncnd, nullptr), sp);   // [32,n]
         delete run; m.free();
         return sn;
@@ -606,8 +649,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 return run->forward(x64, ts, c);
             };
             trellis::SamplerParams sp; sp.steps=(cfg.steps>0?cfg.steps:12); sp.guidance_strength=1.0f; sp.guidance_rescale=0.0f; sp.gi0=0.6f; sp.gi1=0.9f; sp.rescale_t=3.0f;
-            texlat = trellis::sample_flow(fwd, noise((size_t)32*tN),
-                         trellis::FlowCond(tcond, pix ? pc.proj.data()     : nullptr),
+            texlat = trellis::sample_flow_multi(fwd, noise((size_t)32*tN),
+                         view_conds(tcond, tlc, pix ? pc.proj.data() : nullptr, cfg.multi_tex), multi_avg,
                          trellis::FlowCond(tneg,  nullptr), sp);  // [32,tN]
             delete run; m.free();
             for (int n = 0; n < tN; ++n) for (int c = 0; c < 32; ++c) texlat[(size_t)c + 32*n] = texlat[(size_t)c + 32*n]*TEX_STD[c] + TEX_MEAN[c];

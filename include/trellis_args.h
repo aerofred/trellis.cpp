@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace trellis {
 
@@ -23,12 +24,27 @@ enum class ModelFamily {
 
 const char* model_family_name(ModelFamily f);
 
+// How several input views are combined in each flow stage (see SamplerParams/sample_flow).
+enum class MultiImageMode {
+    Stochastic,       // one view per sampler step, in turn: same cost as a single image
+    MultiDiffusion,   // every step averages the conditional velocity of all views: N x the forwards
+};
+
 // Every knob for one TRELLIS.2 image->3D run. Resolved as default -> environment
 // (the historical TRELLIS_* / GSS / GSH names) -> CLI flag, with the CLI winning.
 // trellis-cli and trellis-server share the parser: the server runs it once for its
 // launch defaults, then per request to apply overrides (resolution, bg removal, ...).
 struct TrellisParams {
     std::string image;                                          // input image (image->3D)
+    // Further views of the SAME object (repeat -i/--image). TRELLIS.2 conditions every flow
+    // stage on one image; with extra views each stage combines them per `multi_mode`
+    // (TRELLIS v1's multi-image samplers). Same pose and framing as `image`, or the views fight.
+    std::vector<std::string> extra_images;
+    MultiImageMode multi_mode = MultiImageMode::Stochastic;
+    // Which flow stages see the extra views (--multi-stages); the others use `image` alone.
+    // Shape from one clean view + texture from all of them keeps the silhouette of the main
+    // view while the extra views only inform the colours of what it cannot see.
+    bool multi_ss = true, multi_shape = true, multi_tex = true;
     std::string output = "model.glb";                           // output .glb
     std::string copyright;                                      // glTF asset.copyright metadata
     std::string models = "models";              // GGUF dir; override with --models DIR
@@ -160,5 +176,14 @@ bool parse_faces_arg(const char* value, TrellisParams& p, std::string& error);
 // --faces only steers the QEM path; reject it alongside --decim (cluster grid or 0 = keep
 // full mesh) rather than silently ignoring it. Call after all params are applied.
 bool check_faces_compat(const TrellisParams& p, std::string& error);
+
+// ---- several input views (--multi-mode / --multi-stages, server fields of the same names) ----
+// "stochastic" | "multidiffusion".
+bool parse_multi_mode_arg(const char* value, TrellisParams& p, std::string& error);
+// Comma list of ss, shape, tex, or all.
+bool parse_multi_stages_arg(const char* value, TrellisParams& p, std::string& error);
+// Several views only work with the TRELLIS.2 flows (Pixal3D projects one camera view).
+// Call after all params are applied.
+bool check_multi_image_compat(const TrellisParams& p, std::string& error);
 
 }  // namespace trellis

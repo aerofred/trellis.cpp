@@ -5,7 +5,7 @@ import { renderSettings } from "./settings";
 import { all, clear as clearStore, del as removeRecord, get as getRecord, isEphemeral, newId, put } from "./store";
 import { isTauri, listen, saveBytes, saveToOutputDir } from "./tauri";
 import { Viewer } from "./viewer";
-import { DEFAULT_PARAMS, type GenParams, type GenRecord } from "./types";
+import { DEFAULT_PARAMS, MAX_VIEWS, type GenParams, type GenRecord } from "./types";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -14,6 +14,10 @@ const dropzone = $("dropzone");
 const fileInput = $<HTMLInputElement>("file-input");
 const inputPreview = $<HTMLImageElement>("input-preview");
 const dropHint = $("dropzone-hint");
+const viewsEl = $("views");
+const viewsList = $("views-list");
+const viewsCaption = $("views-caption");
+const multiCtl = $("multi-ctl");
 const generateBtn = $<HTMLButtonElement>("generate-btn");
 const progress = $("progress");
 const progressStage = $("progress-stage");
@@ -31,7 +35,13 @@ const setupBanner = $("setup-banner");
 
 // ---- state ----
 const viewer = new Viewer($("viewer-mount"));
-let inputImage: Blob | null = null;
+/** Input views of one object; inputs[0] is the main view (shown large, named after). */
+interface InputView {
+  blob: Blob;
+  name: string;
+  url: string;
+}
+let inputs: InputView[] = [];
 let inputName = "input.png";
 let currentGlb: Blob | null = null;
 let activeId: string | null = null;
@@ -52,6 +62,8 @@ function readParams(): GenParams {
     bgRemoval: ($("ctl-bg") as HTMLSelectElement).value as GenParams["bgRemoval"],
     uv: ($("ctl-uv") as HTMLSelectElement).value as GenParams["uv"],
     texture: ($("ctl-tex") as HTMLSelectElement).value !== "off",
+    multiMode: ($("ctl-multi-mode") as HTMLSelectElement).value as GenParams["multiMode"],
+    multiStages: ($("ctl-multi-stages") as HTMLSelectElement).value as GenParams["multiStages"],
   };
 }
 
@@ -62,6 +74,8 @@ function applyParams(p: GenParams): void {
   ($("ctl-uv") as HTMLSelectElement).value = p.uv;
   // records saved before this option existed have no field: treat as textured
   ($("ctl-tex") as HTMLSelectElement).value = p.texture === false ? "off" : "on";
+  ($("ctl-multi-mode") as HTMLSelectElement).value = p.multiMode ?? DEFAULT_PARAMS.multiMode!;
+  ($("ctl-multi-stages") as HTMLSelectElement).value = p.multiStages ?? DEFAULT_PARAMS.multiStages!;
 }
 
 // ---- toasts ----
@@ -73,24 +87,108 @@ function toast(msg: string, kind: "" | "ok" | "err" = ""): void {
   setTimeout(() => el.remove(), kind === "err" ? 8000 : 4000);
 }
 
-// ---- input image ----
-function setInput(blob: Blob, name: string): void {
-  inputImage = blob;
-  inputName = name || "input.png";
-  inputPreview.src = URL.createObjectURL(blob);
-  inputPreview.classList.remove("hidden");
-  dropHint.classList.add("hidden");
+// ---- input images ----
+// Several images are several views of the SAME object (front, back, side…): the
+// server conditions the flow stages on all of them. Dropping/picking on the big
+// zone replaces the set; the "+" tile and drops onto the strip add views.
+function renderInputs(): void {
+  const main = inputs[0];
+  inputName = main?.name || "input.png";
+  inputPreview.classList.toggle("hidden", !main);
+  dropHint.classList.toggle("hidden", !!main);
+  if (main) inputPreview.src = main.url;
+  else inputPreview.removeAttribute("src");
+
+  viewsEl.classList.toggle("hidden", !main);
+  multiCtl.classList.toggle("hidden", inputs.length < 2);
+  viewsList.innerHTML = "";
+  inputs.forEach((v, i) => {
+    const item = document.createElement("div");
+    item.className = "vitem" + (i === 0 ? " main" : "");
+    item.title = i === 0 ? `${v.name} (main view)` : `${v.name} — click to make it the main view`;
+    const img = document.createElement("img");
+    img.src = v.url;
+    item.appendChild(img);
+    if (i === 0 && inputs.length > 1) {
+      const tag = document.createElement("div");
+      tag.className = "vtag";
+      tag.textContent = "main";
+      item.appendChild(tag);
+    }
+    const del = document.createElement("button");
+    del.className = "vdel";
+    del.textContent = "✕";
+    del.title = "Remove this view";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      URL.revokeObjectURL(v.url);
+      inputs.splice(i, 1);
+      renderInputs();
+    });
+    item.appendChild(del);
+    item.addEventListener("click", () => {
+      if (i === 0) return;
+      inputs.unshift(...inputs.splice(i, 1));
+      renderInputs();
+    });
+    viewsList.appendChild(item);
+  });
+  if (inputs.length < MAX_VIEWS) {
+    const add = document.createElement("div");
+    add.className = "vadd";
+    add.textContent = "+";
+    add.title = "Add another view of the same object";
+    add.addEventListener("click", () => pickFiles(true));
+    viewsList.appendChild(add);
+  }
+  viewsCaption.textContent =
+    inputs.length > 1
+      ? `${inputs.length} views of one object · click a view to make it the main one`
+      : "Add views of the same object (back, side…) with +";
   updateGenerateEnabled();
 }
 
-dropzone.addEventListener("click", () => fileInput.click());
+function setInputs(files: { blob: Blob; name: string }[], append = false): void {
+  if (!files.length) return;
+  if (!append) {
+    inputs.forEach((v) => URL.revokeObjectURL(v.url));
+    inputs = [];
+  }
+  const room = MAX_VIEWS - inputs.length;
+  if (files.length > room) toast(`At most ${MAX_VIEWS} views — extra images ignored.`, "err");
+  for (const f of files.slice(0, Math.max(0, room))) {
+    inputs.push({ blob: f.blob, name: f.name || "input.png", url: URL.createObjectURL(f.blob) });
+  }
+  renderInputs();
+}
+
+function setInput(blob: Blob, name: string): void {
+  setInputs([{ blob, name }]);
+}
+
+let pickAppend = false;
+function pickFiles(append: boolean): void {
+  pickAppend = append;
+  fileInput.value = "";
+  fileInput.click();
+}
+
+dropzone.addEventListener("click", () => pickFiles(false));
 dropzone.addEventListener("keydown", (e) => {
-  if ((e as KeyboardEvent).key === "Enter") fileInput.click();
+  if ((e as KeyboardEvent).key === "Enter") pickFiles(false);
 });
 fileInput.addEventListener("change", () => {
-  const f = fileInput.files?.[0];
-  if (f) setInput(f, f.name);
+  const files = [...(fileInput.files ?? [])].filter(isImage);
+  setInputs(files.map((f) => ({ blob: f, name: f.name })), pickAppend);
 });
+
+/** Image files of a drop; toasts about the rest. */
+function droppedImages(e: Event): { blob: Blob; name: string }[] {
+  const files = [...((e as DragEvent).dataTransfer?.files ?? [])];
+  const bad = files.filter((f) => !isImage(f));
+  if (bad.length) toast(`"${bad[0].name}" isn't an image — drop a PNG, JPEG or WebP.`, "err");
+  return files.filter(isImage).map((f) => ({ blob: f, name: f.name }));
+}
 // HTML5 drag-and-drop. In Tauri this needs `dragDropEnabled: false` on the
 // window (tauri.conf.json): otherwise the webview's native file-drop handler
 // swallows the drop on Windows/WebView2 and the page never sees the files.
@@ -117,10 +215,22 @@ dropzone.addEventListener("dragleave", (e) => {
 dropzone.addEventListener("drop", (e) => {
   e.preventDefault();
   dropzone.classList.remove("drag");
-  const f = (e as DragEvent).dataTransfer?.files?.[0];
-  if (!f) return;
-  if (isImage(f)) setInput(f, f.name);
-  else toast(`"${f.name}" isn't an image — drop a PNG, JPEG or WebP.`, "err");
+  setInputs(droppedImages(e));
+});
+// Dropping onto the view strip adds views instead of replacing them.
+["dragenter", "dragover"].forEach((ev) =>
+  viewsEl.addEventListener(ev, (e) => {
+    e.preventDefault();
+    viewsEl.classList.add("drag");
+  }),
+);
+viewsEl.addEventListener("dragleave", (e) => {
+  if (!viewsEl.contains((e as DragEvent).relatedTarget as Node | null)) viewsEl.classList.remove("drag");
+});
+viewsEl.addEventListener("drop", (e) => {
+  e.preventDefault();
+  viewsEl.classList.remove("drag");
+  setInputs(droppedImages(e), true);
 });
 window.addEventListener("paste", async (e: ClipboardEvent) => {
   for (const item of e.clipboardData?.items ?? []) {
@@ -146,12 +256,16 @@ function fmtElapsed(ms: number): string {
 }
 
 function updateGenerateEnabled(): void {
-  generateBtn.disabled = !(serverOnline && inputImage && !generating);
+  generateBtn.disabled = !(serverOnline && inputs.length && !generating);
+  generateBtn.textContent = inputs.length > 1 ? `Generate 3D from ${inputs.length} views` : "Generate 3D";
 }
 
 async function doGenerate(): Promise<void> {
-  if (!inputImage || generating) return;
+  if (!inputs.length || generating) return;
   const params = readParams();
+  const images = inputs.map((v) => v.blob);
+  const nViews = images.length;
+  const viewsTag = nViews > 1 ? ` · ${nViews} views` : "";
   generating = true;
   updateGenerateEnabled();
   progress.classList.remove("hidden");
@@ -163,7 +277,7 @@ async function doGenerate(): Promise<void> {
   }, 1000);
   abort = new AbortController();
   try {
-    const { glb } = await generate(inputImage, params, abort.signal);
+    const { glb } = await generate(images, params, abort.signal);
     currentGlb = glb;
 
     const rec: GenRecord = {
@@ -171,7 +285,8 @@ async function doGenerate(): Promise<void> {
       ts: Date.now(),
       name: inputName,
       params,
-      input: inputImage,
+      input: images[0],
+      extraInputs: images.slice(1),
       glb,
       thumb: null,
     };
@@ -185,7 +300,8 @@ async function doGenerate(): Promise<void> {
       try {
         const bytes = new Uint8Array(await glb.arrayBuffer());
         const base = inputName.replace(/\.[^.]+$/, "") || "model";
-        const fname = `${base}_${params.resolution}_seed${params.seed}_${rec.id}.glb`;
+        const views = nViews > 1 ? `_${nViews}views` : "";
+        const fname = `${base}_${params.resolution}${views}_seed${params.seed}_${rec.id}.glb`;
         savedPath = await saveToOutputDir(fname, bytes);
       } catch (e) {
         toast(`Auto-save to output folder failed: ${(e as Error).message}`, "err");
@@ -206,7 +322,7 @@ async function doGenerate(): Promise<void> {
     }
     activeId = rec.id;
     setViewerTools(true);
-    viewerCaption.textContent = `${params.resolution} · seed ${params.seed} · ${(glb.size / 1e6).toFixed(1)} MB`;
+    viewerCaption.textContent = `${params.resolution}${viewsTag} · seed ${params.seed} · ${(glb.size / 1e6).toFixed(1)} MB`;
     await refreshGallery();
 
     // 3) Best-effort 3D preview + gallery thumbnail — never blocks the save above.
@@ -259,17 +375,17 @@ async function loadRecord(id: string): Promise<void> {
     toast((e as Error).message, "err");
     return;
   }
-  inputImage = rec.input;
-  inputName = rec.name;
-  inputPreview.src = URL.createObjectURL(rec.input);
-  inputPreview.classList.remove("hidden");
-  dropHint.classList.add("hidden");
+  const extra = rec.extraInputs ?? [];
+  setInputs([
+    { blob: rec.input, name: rec.name },
+    ...extra.map((blob, i) => ({ blob, name: `view${i + 1}` })),
+  ]);
   applyParams(rec.params);
   currentGlb = rec.glb;
   activeId = rec.id;
   setViewerTools(true);
-  viewerCaption.textContent = `${rec.name} · ${rec.params.resolution} · seed ${rec.params.seed}`;
-  updateGenerateEnabled();
+  const viewsTag = extra.length ? ` · ${extra.length + 1} views` : "";
+  viewerCaption.textContent = `${rec.name} · ${rec.params.resolution}${viewsTag} · seed ${rec.params.seed}`;
   await refreshGallery();
 }
 
@@ -296,7 +412,8 @@ async function refreshGallery(): Promise<void> {
 
     const meta = document.createElement("div");
     meta.className = "gmeta";
-    meta.textContent = `${r.params.resolution}`;
+    const nv = 1 + (r.extraInputs?.length ?? 0);
+    meta.textContent = nv > 1 ? `${r.params.resolution} · ${nv}v` : `${r.params.resolution}`;
     item.appendChild(meta);
 
     const delBtn = document.createElement("button");

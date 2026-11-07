@@ -77,4 +77,16 @@ std::vector<float> sample_flow(const FlowFwd& fwd, std::vector<float> sample,
                                const SamplerParams& sp,
                                std::vector<std::vector<float>>* trace = nullptr);
 
+// Several views of one object (TRELLIS v1's multi-image samplers). `conds` holds one positive
+// branch per view, all with the runner's token count; `neg_cond` is shared (it is image-free).
+//   average == false  "stochastic": step i is conditioned on view i % N alone (both CFG
+//                     branches), so a run costs exactly what a single-image run costs.
+//   average == true   "multidiffusion": every step averages the conditional velocities of all
+//                     N views before guidance; N (+1 when guided) forwards per step.
+// With one view both reduce to sample_flow.
+std::vector<float> sample_flow_multi(const FlowFwd& fwd, std::vector<float> sample,
+                                     const std::vector<FlowCond>& conds, bool average,
+                                     const FlowCond& neg_cond, const SamplerParams& sp,
+                                     std::vector<std::vector<float>>* trace = nullptr);
+
 } // namespace trellis

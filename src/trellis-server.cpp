@@ -1,7 +1,10 @@
 // trellis-server — resident HTTP wrapper around the TRELLIS.2 image->3D pipeline.
 //
 //   GET  /health     -> "ok"
-//   POST /generate    multipart/form-data with an "image" file part; optional text
+//   POST /generate    multipart/form-data with an "image" file part (repeat it for
+//                      more views of the same object, main view first; trellis model
+//                      only, combined per "multi_mode" = stochastic|multidiffusion and
+//                      "multi_stages" = comma list of ss,shape,tex or all); optional text
 //                      fields "seed", "resolution" (512/1024/1536), "bg_removal"
 //                      (threshold|birefnet), "uv" (xatlas = default, unique
 //                      chart space; box = faster projection), "band" (narrow-band
@@ -30,6 +33,7 @@
 #include <utility>
 #include <string>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -100,7 +104,9 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"missing 'image' file part\"}", "application/json");
             return;
         }
-        const auto& image = req.get_file_value("image");
+        // Repeat the "image" part for further views of the same object; the first is the main
+        // view (see TrellisParams::extra_images). Parts keep their upload order.
+        const std::vector<httplib::MultipartFormData> images = req.get_file_values("image");
 
         // Per-request params start from the launch defaults, then apply overrides.
         trellis::TrellisParams p = base;
@@ -149,6 +155,17 @@ int main(int argc, char** argv) {
             p.webp = (w == "off" || w == "0" || w == "false") ? 0
                    : (w == "on"  || w == "1" || w == "true")  ? 1 : -1;
         }
+        for (const char* field : {"multi_mode", "multi_stages"}) {
+            if (!req.has_file(field)) continue;
+            const std::string v = req.get_file_value(field).content;
+            std::string error;
+            if (!(std::string(field) == "multi_mode" ? trellis::parse_multi_mode_arg(v.c_str(), p, error)
+                                                     : trellis::parse_multi_stages_arg(v.c_str(), p, error))) {
+                res.status = 400;
+                res.set_content(error + "\n", "text/plain");
+                return;
+            }
+        }
 
         std::string stem;
         try {
@@ -159,21 +176,45 @@ int main(int argc, char** argv) {
             return;
         }
         p.image  = stem + ".png";
+        p.extra_images.clear();   // launch-time -i views never leak into a request
+        for (size_t v = 1; v < images.size(); ++v) p.extra_images.push_back(stem + "_view" + std::to_string(v) + ".png");
         p.output = stem + ".glb";
+        {
+            std::string error;
+            if (!trellis::check_multi_image_compat(p, error)) {
+                res.status = 400;
+                res.set_content(error + "\n", "text/plain");
+                return;
+            }
+        }
+        auto remove_inputs = [&] {
+            std::remove(p.image.c_str());
+            for (const auto& e : p.extra_images) std::remove(e.c_str());
+        };
 
         std::string glb;
         std::string error_message = "3D reconstruction failed";
         {
             std::lock_guard<std::mutex> lk(gen_mu);
-            if (!write_file_bytes(p.image, image.content)) {
-                res.status = 500;
-                res.set_content("{\"error\":\"failed to stage input image\"}", "application/json");
-                return;
+            size_t total_bytes = 0;
+            for (size_t v = 0; v < images.size(); ++v) {
+                total_bytes += images[v].content.size();
+                if (!write_file_bytes(v == 0 ? p.image : p.extra_images[v - 1], images[v].content)) {
+                    remove_inputs();
+                    res.status = 500;
+                    res.set_content("{\"error\":\"failed to stage input image\"}", "application/json");
+                    return;
+                }
             }
-            fprintf(stderr, "[trellis-server] generate: %zu-byte image, seed %u, res %s, bg %s, uv %s, faces %d, texture %s\n",
-                    image.content.size(), p.seed, p.cascade ? std::to_string(p.hr_res).c_str() : "512",
+            fprintf(stderr, "[trellis-server] generate: %zu image(s), %zu bytes, seed %u, res %s, bg %s, uv %s, faces %d, texture %s",
+                    images.size(), total_bytes, p.seed, p.cascade ? std::to_string(p.hr_res).c_str() : "512",
                     p.birefnet < 0 ? "auto" : (p.birefnet ? "birefnet" : "threshold"), p.xatlas ? "xatlas" : "box",
                     trellis::qem_face_target(p), p.texture ? "on" : "off");
+            if (images.size() > 1)
+                fprintf(stderr, ", %s, stages%s%s%s",
+                        p.multi_mode == trellis::MultiImageMode::MultiDiffusion ? "multidiffusion" : "stochastic",
+                        p.multi_ss ? " ss" : "", p.multi_shape ? " shape" : "", p.multi_tex ? " tex" : "");
+            fprintf(stderr, "\n");
             try {
                 int rc = trellis_run(p);
                 if (rc == 0) glb = read_file_bytes(p.output);
@@ -181,7 +222,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "[trellis-server] generate failed: %s\n", e.what());
                 error_message = e.what();
             }
-            std::remove(p.image.c_str());
+            remove_inputs();
             std::remove(p.output.c_str());
             // trellis_run also writes sibling debug artifacts; clean them up too.
             std::remove((stem + ".ply").c_str());

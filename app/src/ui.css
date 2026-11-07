@@ -96,6 +96,36 @@ body {
 .dropzone-hint { text-align: center; color: var(--muted); pointer-events: none; }
 .dz-icon { font-size: 26px; margin-bottom: 6px; }
 .input-preview { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #0e1014; }
+.small { font-size: 11px; margin-top: 4px; }
+
+/* ---- input views (main view first) ---- */
+.views { display: flex; flex-direction: column; gap: 6px; }
+.views-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.views.drag .views-list { outline: 1.5px dashed var(--accent); outline-offset: 3px; border-radius: 8px; }
+.vitem, .vadd {
+  position: relative; width: 52px; height: 52px; flex: 0 0 auto;
+  border-radius: 7px; overflow: hidden; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel-2);
+}
+.vitem img { width: 100%; height: 100%; object-fit: cover; }
+.vitem.main { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.vitem .vtag {
+  position: absolute; bottom: 0; left: 0; right: 0; font-size: 9px; text-align: center;
+  background: rgba(0,0,0,0.6); color: #cfd6e6; padding: 1px 0;
+}
+.vitem .vdel {
+  position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; padding: 0;
+  border: none; border-radius: 50%; background: rgba(0,0,0,0.6); color: #fff;
+  font-size: 10px; line-height: 16px; cursor: pointer; display: none;
+}
+.vitem:hover .vdel { display: block; }
+.vadd {
+  display: flex; align-items: center; justify-content: center;
+  border-style: dashed; color: var(--muted); font-size: 22px;
+}
+.vadd:hover { border-color: var(--accent); color: var(--text); }
+.views-caption { font-size: 11px; }
+.multi-ctl { display: flex; flex-direction: column; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
 
 /* ---- controls ---- */
 .controls { display: flex; flex-direction: column; gap: 10px; }

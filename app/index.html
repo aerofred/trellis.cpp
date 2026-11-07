@@ -31,13 +31,36 @@
           <img id="input-preview" class="input-preview hidden" alt="input" />
           <div id="dropzone-hint" class="dropzone-hint">
             <div class="dz-icon">⬆</div>
-            <div>Drop an image here</div>
+            <div>Drop one or more images here</div>
             <div class="muted">or click to browse</div>
+            <div class="muted small">several images = views of the same object</div>
           </div>
-          <input id="file-input" type="file" accept="image/*" hidden />
+          <input id="file-input" type="file" accept="image/*" multiple hidden />
+        </div>
+
+        <div id="views" class="views hidden" title="Click a view to make it the main one">
+          <div id="views-list" class="views-list"></div>
+          <div id="views-caption" class="views-caption muted"></div>
         </div>
 
         <div class="controls">
+          <div id="multi-ctl" class="multi-ctl hidden">
+            <label class="ctl" title="stochastic: one view per sampler step (same cost as one image). multidiffusion: every step averages all views (N× the flow passes, usually more faithful).">
+              <span>Multi-view mode</span>
+              <select id="ctl-multi-mode">
+                <option value="stochastic" selected>stochastic · fast</option>
+                <option value="multidiffusion">multidiffusion · faithful</option>
+              </select>
+            </label>
+            <label class="ctl" title="Stages left out are conditioned on the main view alone. 'texture only' keeps the main view's geometry and takes only colours from the others.">
+              <span>Views used for</span>
+              <select id="ctl-multi-stages">
+                <option value="all" selected>structure + shape + texture</option>
+                <option value="shape,tex">shape + texture</option>
+                <option value="tex">texture only</option>
+              </select>
+            </label>
+          </div>
           <label class="ctl">
             <span>Resolution</span>
             <select id="ctl-res">

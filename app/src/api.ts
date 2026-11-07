@@ -1,6 +1,7 @@
 // HTTP client for the resident trellis-server (see src/trellis-server.cpp):
 //   GET  /health   -> "ok"
-//   POST /generate  multipart: image file + seed/resolution/bg_removal/uv/texture fields
+//   POST /generate  multipart: image file(s) + seed/resolution/bg_removal/uv/texture
+//                   (+ multi_mode/multi_stages with several views) fields
 //                   -> model/gltf-binary, or JSON {"error": "..."} on failure.
 
 import { apiBase, loadConfig } from "./config";
@@ -23,15 +24,23 @@ export async function health(timeoutMs = 2000): Promise<boolean> {
   }
 }
 
-/** trellis-server maps bg_removal: "auto" keeps the server default (no field). */
-function toForm(image: Blob, p: GenParams): FormData {
+/**
+ * trellis-server maps bg_removal: "auto" keeps the server default (no field).
+ * Several images = several "image" parts, main view first; the multi-view fields
+ * are only sent then (the server rejects them with Pixal3D only when views > 1).
+ */
+function toForm(images: Blob[], p: GenParams): FormData {
   const fd = new FormData();
-  fd.append("image", image, "input.png");
+  images.forEach((image, i) => fd.append("image", image, i ? `view${i}.png` : "input.png"));
   fd.append("seed", String(p.seed));
   fd.append("resolution", String(p.resolution));
   if (p.bgRemoval !== "auto") fd.append("bg_removal", p.bgRemoval);
   fd.append("uv", p.uv);
   if (!p.texture) fd.append("texture", "off");
+  if (images.length > 1) {
+    fd.append("multi_mode", p.multiMode ?? "stochastic");
+    fd.append("multi_stages", p.multiStages ?? "all");
+  }
   return fd;
 }
 
@@ -40,22 +49,25 @@ export interface GenerateResult {
 }
 
 export async function generate(
-  image: Blob,
+  images: Blob[],
   params: GenParams,
   signal?: AbortSignal,
 ): Promise<GenerateResult> {
+  if (!images.length) throw new Error("no input image");
   const res = await fetch(`${await base()}/generate`, {
     method: "POST",
-    body: toForm(image, params),
+    body: toForm(images, params),
     signal,
   });
   if (!res.ok) {
     let msg = `generation failed (HTTP ${res.status})`;
+    // JSON {"error": ...} from the pipeline, plain text from parameter validation.
+    const body = await res.text().catch(() => "");
     try {
-      const j = await res.json();
+      const j = JSON.parse(body);
       if (j && typeof j.error === "string") msg = j.error;
     } catch {
-      /* non-JSON error body */
+      if (body.trim()) msg = body.trim();
     }
     throw new Error(msg);
   }
