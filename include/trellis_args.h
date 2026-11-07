@@ -72,6 +72,7 @@ struct TrellisParams {
     // 0 any of the 24 right-angle turns, 1 upright (turned about the vertical axis only: a
     // pipeline that assumes TRELLIS's up axis), 2 as the input view only.
     int seed_orientations = 0;
+    bool seed_search_only = false;   // --seed-search-only: print the seed table and stop (no model)
 
     ModelFamily family = ModelFamily::Trellis;   // --model trellis|pixal3d
     // Pixal3D only. The projection needs the camera the image was "taken" with: upstream

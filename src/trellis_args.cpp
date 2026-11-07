@@ -267,6 +267,8 @@ void print_usage(const char* argv0, bool server) {
         "                          an aligned one preferred) and share of stray one-voxel\n"
         "                          sheets. Only the best is finished; the output is identical\n"
         "                          to --seed <chosen>, which is printed\n"
+        "      --seed-search-only  with --seeds: print the scored seeds and stop (no model is\n"
+        "                          written; a few seconds per seed)\n"
         "      --seed-orientations any|upright|input\n"
         "                          orientations a candidate is scored in (default any; upright =\n"
         "                          turned about the vertical axis only, for pipelines that rely\n"
@@ -396,6 +398,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   else { fprintf(stderr, "[trellis] --sched expects on or off\n"); return false; } }
         else if (a == "--vulkan-fallback")      { p.vulkan_fallback = 1; }
         else if (a == "--no-vulkan-fallback")   { p.vulkan_fallback = 0; }
+        else if (a == "--seed-search-only")     { p.seed_search_only = true; }
         else if (a == "--seeds" || a == "--seed-orientations") {
                                                   const char* v = need(a.c_str()); if (!v) return false;
                                                   std::string error;

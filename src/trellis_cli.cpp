@@ -581,6 +581,7 @@ int trellis_run(const trellis::TrellisParams& cfg, uint32_t* seed_used) {
             run_seed = cands[best].seed;
             rng = cands[best].rng; randn = cands[best].randn;
             fprintf(stderr, "[trellis] seed search: chosen seed %u\n", run_seed);
+            if (cfg.seed_search_only) { printf("[seed-search-only] done (%.1fs)\n", now() - t0); return 0; }
         }
         coords = std::move(cands[best].coords);
         if (seed_used) *seed_used = run_seed;
