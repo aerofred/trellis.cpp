@@ -90,6 +90,7 @@ int main(int argc, char** argv) {
         res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
         res.set_header("Access-Control-Max-Age", "86400");
+        res.set_header("Access-Control-Expose-Headers", "X-Trellis-Seed");
     });
     svr.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
         res.status = 204;  // headers added by the post-routing handler above
@@ -228,6 +229,7 @@ int main(int argc, char** argv) {
         };
 
         std::string glb;
+        uint32_t seed_used = p.seed;
         std::string error_message = "3D reconstruction failed";
         {
             std::lock_guard<std::mutex> lk(gen_mu);
@@ -251,7 +253,7 @@ int main(int argc, char** argv) {
                         p.multi_ss ? " ss" : "", p.multi_shape ? " shape" : "", p.multi_tex ? " tex" : "");
             fprintf(stderr, "\n");
             try {
-                int rc = trellis_run(p);
+                int rc = trellis_run(p, &seed_used);
                 if (rc == 0) glb = read_file_bytes(p.output);
             } catch (const std::exception& e) {
                 fprintf(stderr, "[trellis-server] generate failed: %s\n", e.what());
@@ -262,6 +264,8 @@ int main(int argc, char** argv) {
             // trellis_run also writes sibling debug artifacts; clean them up too.
             std::remove((stem + ".ply").c_str());
             std::remove((stem + "_base.png").c_str());
+            std::remove((stem + "_normal.png").c_str());   // --normal-map sidecars
+            std::remove((stem + "_orm.png").c_str());
         }
 
         if (glb.empty()) {
@@ -282,6 +286,8 @@ int main(int argc, char** argv) {
             res.set_content("{\"error\":\"" + escaped + "\"}", "application/json");
             return;
         }
+        // The seed actually used (a "seeds" search picks one): lets a client store a reproducible record.
+        res.set_header("X-Trellis-Seed", std::to_string(seed_used));
         res.set_content(glb.data(), glb.size(), "model/gltf-binary");
     });
 

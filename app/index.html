@@ -60,6 +60,14 @@
                 <option value="tex">texture only</option>
               </select>
             </label>
+            <label class="ctl" title="Share of every view after the main one (steps in stochastic mode, weight in the multidiffusion mean). Lower it when a secondary view is in perspective or less reliable: the main view then keeps the proportions.">
+              <span>Other views weight</span>
+              <select id="ctl-view-weight">
+                <option value="1" selected>equal</option>
+                <option value="0.5">0.5</option>
+                <option value="0.3">0.3 · main view leads</option>
+              </select>
+            </label>
           </div>
           <label class="ctl">
             <span>Resolution</span>
@@ -94,6 +102,41 @@
           <label class="ctl">
             <span>Seed</span>
             <input id="ctl-seed" type="number" min="0" step="1" value="42" />
+          </label>
+          <label class="ctl" title="Try several seeds from the one above: the coarse structure is sampled for each (a few seconds), scored against the cut-out silhouette and for stray flat sheets, and only the best is finished. The seed it picks is shown and saved with the model.">
+            <span>Seed search</span>
+            <select id="ctl-seed-search">
+              <option value="0" selected>off</option>
+              <option value="4">4 seeds</option>
+              <option value="6">6 seeds</option>
+              <option value="8">8 seeds</option>
+            </select>
+          </label>
+          <label class="ctl" title="TRELLIS may turn the object (reversed, lying down) depending on the seed. 'upright' only accepts turns about the vertical axis; 'as the image' only the input orientation.">
+            <span>Search orientation</span>
+            <select id="ctl-seed-orient">
+              <option value="any" selected>any</option>
+              <option value="upright">upright</option>
+              <option value="input">as the image</option>
+            </select>
+          </label>
+          <label class="ctl" title="Triangle budget of the simplified mesh (empty = default: 300K at 1024, 150K at 512). E.g. 12000 for a game prop.">
+            <span>Faces</span>
+            <input id="ctl-faces" type="number" min="1000" step="1000" placeholder="auto" />
+          </label>
+          <label class="ctl" title="Bake the dense surface onto the simplified mesh: tangent-space normal map and ambient occlusion (glTF normalTexture / occlusionTexture). Most useful with a low face budget.">
+            <span>Detail maps</span>
+            <select id="ctl-normal-map">
+              <option value="off" selected>off</option>
+              <option value="on">normal + occlusion</option>
+            </select>
+          </label>
+          <label class="ctl" title="Drop the faces that cannot be seen from outside (inner shells left by the remesh) before the UV unwrap: the texture atlas then only holds visible surface.">
+            <span>Hidden faces</span>
+            <select id="ctl-cull">
+              <option value="off" selected>keep</option>
+              <option value="on">drop</option>
+            </select>
           </label>
         </div>
 

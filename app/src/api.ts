@@ -40,11 +40,25 @@ function toForm(images: Blob[], p: GenParams): FormData {
   if (images.length > 1) {
     fd.append("multi_mode", p.multiMode ?? "stochastic");
     fd.append("multi_stages", p.multiStages ?? "all");
+    const w = p.viewWeight ?? 1;
+    if (w !== 1) fd.append("view_weights", ["1", ...images.slice(1).map(() => String(w))].join(","));
   }
+  const n = p.seedSearch ?? 0;
+  if (n > 1) {
+    // seed, seed+1, ... (the server wants seeds >= 1)
+    const first = Math.max(1, p.seed);
+    fd.append("seeds", Array.from({ length: n }, (_, i) => String(first + i)).join(","));
+    fd.append("seed_orientations", p.seedOrientations ?? "any");
+  }
+  if (p.faces != null && p.faces > 0) fd.append("faces", String(p.faces));
+  if (p.normalMap) fd.append("normal_map", "on");
+  if (p.cullHidden) fd.append("cull_hidden", "on");
   return fd;
 }
 
 export interface GenerateResult {
+  /** Seed the model was generated with (X-Trellis-Seed; the search's pick with seedSearch). */
+  seedUsed?: number;
   glb: Blob;
 }
 
@@ -73,5 +87,7 @@ export async function generate(
   }
   const glb = await res.blob();
   if (glb.size === 0) throw new Error("server returned an empty model");
-  return { glb };
+  const seedHeader = res.headers.get("X-Trellis-Seed");
+  const seedUsed = seedHeader != null && /^\d+$/.test(seedHeader) ? parseInt(seedHeader, 10) : undefined;
+  return { glb, seedUsed };
 }

@@ -7,6 +7,8 @@ export type Uv = "xatlas" | "box";
 export type MultiMode = "stochastic" | "multidiffusion";
 /** Which flow stages see every view (server field multi_stages); the others use the main view. */
 export type MultiStages = "all" | "shape,tex" | "tex";
+/** Orientations a seed-search candidate may take (server field seed_orientations). */
+export type SeedOrientations = "any" | "upright" | "input";
 
 /** Generation knobs mapped onto trellis-server's POST /generate form fields. */
 export interface GenParams {
@@ -19,6 +21,17 @@ export interface GenParams {
   /** Only sent with several input images. Absent on records saved before multi-view. */
   multiMode?: MultiMode;
   multiStages?: MultiStages;
+  /** Weight of every view after the main one (server field view_weights "1,w,w..."); 1 = equal. */
+  viewWeight?: number;
+  /** Seed search: number of seeds tried from `seed` on (server field seeds); 0 or 1 = off. */
+  seedSearch?: number;
+  seedOrientations?: SeedOrientations;
+  /** Face budget for the QEM simplifier (server field faces); null/absent = server default. */
+  faces?: number | null;
+  /** Baked normal map + ambient occlusion from the dense surface (server field normal_map). */
+  normalMap?: boolean;
+  /** Drop faces that cannot be seen from outside before the unwrap (server field cull_hidden). */
+  cullHidden?: boolean;
 }
 
 export const DEFAULT_PARAMS: GenParams = {
@@ -29,6 +42,12 @@ export const DEFAULT_PARAMS: GenParams = {
   texture: true,
   multiMode: "stochastic",
   multiStages: "all",
+  viewWeight: 1,
+  seedSearch: 0,
+  seedOrientations: "any",
+  faces: null,
+  normalMap: false,
+  cullHidden: false,
 };
 
 /** Upper bound on input views: each one costs a bg-removal + DINOv3 pass. */

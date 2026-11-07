@@ -64,6 +64,15 @@ function readParams(): GenParams {
     texture: ($("ctl-tex") as HTMLSelectElement).value !== "off",
     multiMode: ($("ctl-multi-mode") as HTMLSelectElement).value as GenParams["multiMode"],
     multiStages: ($("ctl-multi-stages") as HTMLSelectElement).value as GenParams["multiStages"],
+    viewWeight: parseFloat(($("ctl-view-weight") as HTMLSelectElement).value) || 1,
+    seedSearch: parseInt(($("ctl-seed-search") as HTMLSelectElement).value, 10) || 0,
+    seedOrientations: ($("ctl-seed-orient") as HTMLSelectElement).value as GenParams["seedOrientations"],
+    faces: (() => {
+      const f = parseInt(($("ctl-faces") as HTMLInputElement).value, 10);
+      return isNaN(f) || f < 1000 ? null : f;
+    })(),
+    normalMap: ($("ctl-normal-map") as HTMLSelectElement).value === "on",
+    cullHidden: ($("ctl-cull") as HTMLSelectElement).value === "on",
   };
 }
 
@@ -76,6 +85,13 @@ function applyParams(p: GenParams): void {
   ($("ctl-tex") as HTMLSelectElement).value = p.texture === false ? "off" : "on";
   ($("ctl-multi-mode") as HTMLSelectElement).value = p.multiMode ?? DEFAULT_PARAMS.multiMode!;
   ($("ctl-multi-stages") as HTMLSelectElement).value = p.multiStages ?? DEFAULT_PARAMS.multiStages!;
+  // records saved before these options existed have no fields: defaults
+  ($("ctl-view-weight") as HTMLSelectElement).value = String(p.viewWeight ?? 1);
+  ($("ctl-seed-search") as HTMLSelectElement).value = String(p.seedSearch ?? 0);
+  ($("ctl-seed-orient") as HTMLSelectElement).value = p.seedOrientations ?? "any";
+  ($("ctl-faces") as HTMLInputElement).value = p.faces ? String(p.faces) : "";
+  ($("ctl-normal-map") as HTMLSelectElement).value = p.normalMap ? "on" : "off";
+  ($("ctl-cull") as HTMLSelectElement).value = p.cullHidden ? "on" : "off";
 }
 
 // ---- toasts ----
@@ -277,14 +293,18 @@ async function doGenerate(): Promise<void> {
   }, 1000);
   abort = new AbortController();
   try {
-    const { glb } = await generate(images, params, abort.signal);
+    const { glb, seedUsed } = await generate(images, params, abort.signal);
     currentGlb = glb;
+    // A seed search returns the seed it picked: the record keeps that seed (search off), so
+    // reloading it reproduces this exact model.
+    const searched = (params.seedSearch ?? 0) > 1 && seedUsed != null;
+    const recParams: GenParams = searched ? { ...params, seed: seedUsed!, seedSearch: 0 } : params;
 
     const rec: GenRecord = {
       id: newId(),
       ts: Date.now(),
       name: inputName,
-      params,
+      params: recParams,
       input: images[0],
       extraInputs: images.slice(1),
       glb,
@@ -301,7 +321,7 @@ async function doGenerate(): Promise<void> {
         const bytes = new Uint8Array(await glb.arrayBuffer());
         const base = inputName.replace(/\.[^.]+$/, "") || "model";
         const views = nViews > 1 ? `_${nViews}views` : "";
-        const fname = `${base}_${params.resolution}${views}_seed${params.seed}_${rec.id}.glb`;
+        const fname = `${base}_${params.resolution}${views}_seed${recParams.seed}_${rec.id}.glb`;
         savedPath = await saveToOutputDir(fname, bytes);
       } catch (e) {
         toast(`Auto-save to output folder failed: ${(e as Error).message}`, "err");
@@ -322,7 +342,7 @@ async function doGenerate(): Promise<void> {
     }
     activeId = rec.id;
     setViewerTools(true);
-    viewerCaption.textContent = `${params.resolution}${viewsTag} · seed ${params.seed} · ${(glb.size / 1e6).toFixed(1)} MB`;
+    viewerCaption.textContent = `${params.resolution}${viewsTag} · seed ${recParams.seed}${searched ? " (search)" : ""} · ${(glb.size / 1e6).toFixed(1)} MB`;
     await refreshGallery();
 
     // 3) Best-effort 3D preview + gallery thumbnail — never blocks the save above.
